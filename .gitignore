@@ -2,6 +2,9 @@
 .xmake/
 build/
 
+# Large model weights (local only)
+/models/
+
 # Binaries
 bin/
 lib/
@@ -88,5 +91,3 @@ htmlcov/
 Thumbs.db
 ehthumbs.db
 desktop.ini
-
-models/
