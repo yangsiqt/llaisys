@@ -39,6 +39,10 @@ load_runtime(LIB_LLAISYS)
 load_tensor(LIB_LLAISYS)
 load_ops(LIB_LLAISYS)
 
+# Load Qwen2 model functions
+from .qwen2 import load_qwen2
+load_qwen2(LIB_LLAISYS)
+
 
 __all__ = [
     "LIB_LLAISYS",

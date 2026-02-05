@@ -93,4 +93,9 @@ __C {
         size_t end) {
         return new LlaisysTensor{tensor->tensor->slice(dim, start, end)};
     }
+
+    llaisysTensor_t tensorContiguous(
+        llaisysTensor_t tensor) {
+        return new LlaisysTensor{tensor->tensor->contiguous()};
+    }
 }

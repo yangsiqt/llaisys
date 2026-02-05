@@ -36,6 +36,12 @@ __C {
     __export void llaisysQwen2ModelDestroy(struct LlaisysQwen2Model * model);
 
     __export struct LlaisysQwen2Weights *llaisysQwen2ModelWeights(struct LlaisysQwen2Model * model);
+    
+    // Set weights (helper functions)
+    __export void llaisysQwen2ModelSetInEmbed(struct LlaisysQwen2Model * model, llaisysTensor_t tensor);
+    __export void llaisysQwen2ModelSetOutEmbed(struct LlaisysQwen2Model * model, llaisysTensor_t tensor);
+    __export void llaisysQwen2ModelSetOutNormW(struct LlaisysQwen2Model * model, llaisysTensor_t tensor);
+    __export void llaisysQwen2ModelSetLayerWeight(struct LlaisysQwen2Model * model, const char* name, size_t layer_idx, llaisysTensor_t tensor);
 
     __export int64_t llaisysQwen2ModelInfer(struct LlaisysQwen2Model * model, int64_t * token_ids, size_t ntoken);
 }

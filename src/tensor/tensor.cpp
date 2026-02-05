@@ -1,6 +1,7 @@
 #include "tensor.hpp"
 
 #include "../utils.hpp"
+#include "../ops/rearrange/op.hpp"
 
 #include <cstring>
 #include <numeric>
@@ -164,32 +165,126 @@ void Tensor::debug() const {
 }
 
 bool Tensor::isContiguous() const {
-    TO_BE_IMPLEMENTED();
+    // A tensor is contiguous if the strides follow the pattern:
+    // stride[i] = stride[i+1] * shape[i+1] for all i from 0 to ndim-2
+    // and stride[ndim-1] = 1
+    size_t ndim_ = this->ndim();
+    if (ndim_ == 0) return true;
+    
+    const auto& shape_ = this->shape();
+    const auto& strides_ = this->strides();
+    
+    // Check if last stride is 1
+    if (strides_[ndim_ - 1] != 1) return false;
+    
+    // Check if each stride equals the product of all following dimensions
+    ptrdiff_t expected_stride = 1;
+    for (size_t i = ndim_; i > 0; i--) {
+        size_t idx = i - 1;
+        if (strides_[idx] != expected_stride) return false;
+        expected_stride *= shape_[idx];
+    }
+    
     return true;
 }
 
 tensor_t Tensor::permute(const std::vector<size_t> &order) const {
-    TO_BE_IMPLEMENTED();
-    return std::shared_ptr<Tensor>(new Tensor(_meta, _storage));
+    size_t ndim_ = this->ndim();
+    CHECK_ARGUMENT(order.size() == ndim_, "Permute order size must match tensor dimensions");
+    
+    // Check that order is a valid permutation
+    std::vector<bool> seen(ndim_, false);
+    for (size_t i = 0; i < ndim_; i++) {
+        CHECK_ARGUMENT(order[i] < ndim_, "Invalid dimension in permute order");
+        CHECK_ARGUMENT(!seen[order[i]], "Duplicate dimension in permute order");
+        seen[order[i]] = true;
+    }
+    
+    // Create new meta with permuted shape and strides
+    TensorMeta new_meta = _meta;
+    std::vector<size_t> new_shape(ndim_);
+    std::vector<ptrdiff_t> new_strides(ndim_);
+    
+    for (size_t i = 0; i < ndim_; i++) {
+        new_shape[i] = _meta.shape[order[i]];
+        new_strides[i] = _meta.strides[order[i]];
+    }
+    
+    new_meta.shape = new_shape;
+    new_meta.strides = new_strides;
+    
+    return std::shared_ptr<Tensor>(new Tensor(new_meta, _storage, _offset));
 }
 
 tensor_t Tensor::view(const std::vector<size_t> &shape) const {
-    TO_BE_IMPLEMENTED();
-    return std::shared_ptr<Tensor>(new Tensor(_meta, _storage));
+    // View requires the tensor to be contiguous
+    CHECK_ARGUMENT(this->isContiguous(), "View requires contiguous tensor");
+    
+    // Check that total number of elements matches
+    size_t new_numel = 1;
+    for (size_t s : shape) {
+        new_numel *= s;
+    }
+    CHECK_ARGUMENT(new_numel == this->numel(), "View shape must have same number of elements");
+    
+    // Create new strides for the new shape (contiguous layout)
+    size_t new_ndim = shape.size();
+    std::vector<ptrdiff_t> new_strides(new_ndim);
+    ptrdiff_t stride = 1;
+    for (size_t i = new_ndim; i > 0; i--) {
+        new_strides[i - 1] = stride;
+        stride *= shape[i - 1];
+    }
+    
+    TensorMeta new_meta{_meta.dtype, shape, new_strides};
+    return std::shared_ptr<Tensor>(new Tensor(new_meta, _storage, _offset));
 }
 
 tensor_t Tensor::slice(size_t dim, size_t start, size_t end) const {
-    TO_BE_IMPLEMENTED();
-    return std::shared_ptr<Tensor>(new Tensor(_meta, _storage));
+    size_t ndim_ = this->ndim();
+    CHECK_ARGUMENT(dim < ndim_, "Slice dimension out of range");
+    CHECK_ARGUMENT(start < end, "Slice start must be less than end");
+    CHECK_ARGUMENT(end <= _meta.shape[dim], "Slice end out of range");
+    
+    // Create new meta with updated shape for the sliced dimension
+    TensorMeta new_meta = _meta;
+    new_meta.shape[dim] = end - start;
+    
+    // Calculate new offset: move pointer to the start position
+    size_t new_offset = _offset + start * _meta.strides[dim] * this->elementSize();
+    
+    return std::shared_ptr<Tensor>(new Tensor(new_meta, _storage, new_offset));
 }
 
 void Tensor::load(const void *src_) {
-    TO_BE_IMPLEMENTED();
+    core::context().setDevice(this->deviceType(), this->deviceId());
+    const std::byte *src = static_cast<const std::byte *>(src_);
+    size_t size = this->numel() * this->elementSize();
+    
+    if (this->deviceType() == LLAISYS_DEVICE_CPU) {
+        // CPU to CPU copy
+        core::context().runtime().api()->memcpy_sync(
+            this->data(), src, size, LLAISYS_MEMCPY_H2H);
+    } else {
+        // Host to Device copy
+        core::context().runtime().api()->memcpy_sync(
+            this->data(), src, size, LLAISYS_MEMCPY_H2D);
+    }
 }
 
 tensor_t Tensor::contiguous() const {
-    TO_BE_IMPLEMENTED();
-    return std::shared_ptr<Tensor>(new Tensor(_meta, _storage));
+    // If already contiguous, return a copy sharing the same storage
+    if (this->isContiguous()) {
+        return std::shared_ptr<Tensor>(new Tensor(_meta, _storage, _offset));
+    }
+    
+    // Create a new contiguous tensor with same shape
+    auto result = Tensor::create(this->shape(), this->dtype(), this->deviceType(), this->deviceId());
+    
+    // Use rearrange to copy data with proper stride handling
+    ops::rearrange(result, std::shared_ptr<Tensor>(new Tensor(_meta, _storage, _offset)));
+    
+    return result;
 }
 
 tensor_t Tensor::reshape(const std::vector<size_t> &shape) const {

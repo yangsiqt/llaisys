@@ -1,8 +1,16 @@
-#pragma once
-#include "llaisys.h"
+#ifndef LLAISYS_OPS_ADD_CPU_HPP
+#define LLAISYS_OPS_ADD_CPU_HPP
 
-#include <cstddef>
+#include "../../../tensor/tensor.hpp"
 
-namespace llaisys::ops::cpu {
-void add(std::byte *c, const std::byte *a, const std::byte *b, llaisysDataType_t type, size_t size);
-}
+namespace llaisys {
+namespace ops {
+namespace cpu {
+
+void add_cpu(const tensor_t& out, const tensor_t& a, const tensor_t& b);
+
+} // namespace cpu
+} // namespace ops
+} // namespace llaisys
+
+#endif // LLAISYS_OPS_ADD_CPU_HPP
