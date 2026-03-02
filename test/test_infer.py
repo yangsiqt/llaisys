@@ -8,6 +8,7 @@ from huggingface_hub import snapshot_download
 import os
 import time
 import llaisys
+from llaisys.models import Qwen2
 import sys
 import io
 
@@ -54,13 +55,13 @@ def hf_infer(
     return outputs[0].tolist(), result
 
 
-def load_llaisys_model(model_path, device_name):
+def load_llaisys_model(model_path, device_name) -> Qwen2:
     model = llaisys.models.Qwen2(model_path, llaisys_device(device_name))
     return model
 
 
 def llaisys_infer(
-    prompt, tokenizer, model, max_new_tokens=128, top_p=0.8, top_k=50, temperature=0.8
+    prompt, tokenizer, model: Qwen2, max_new_tokens=128, top_p=0.8, top_k=50, temperature=0.8
 ):
     input_content = tokenizer.apply_chat_template(
         conversation=[{"role": "user", "content": prompt}],
