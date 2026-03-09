@@ -5,6 +5,10 @@
 
 #include "cpu/rope_cpu.hpp"
 
+#ifdef ENABLE_NVIDIA_API
+#include "nvidia/rope_nvidia.hpp"
+#endif
+
 namespace llaisys::ops {
 void rope(tensor_t out, tensor_t in, tensor_t pos_ids, float theta) {
     CHECK_SAME_DEVICE(out, in, pos_ids);
@@ -38,8 +42,7 @@ void rope(tensor_t out, tensor_t in, tensor_t pos_ids, float theta) {
                         out->dtype(), seq_len, n_heads, head_dim);
 #ifdef ENABLE_NVIDIA_API
     case LLAISYS_DEVICE_NVIDIA:
-        TO_BE_IMPLEMENTED();
-        return;
+        return nvidia::rope(out->data(), in->data(), pos_ids->data(), theta, out->dtype(), seq_len, n_heads, head_dim);
 #endif
     default:
         EXCEPTION_UNSUPPORTED_DEVICE;
