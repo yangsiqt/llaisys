@@ -126,6 +126,10 @@ target("llaisys")
     add_deps("llaisys-ops")
     add_deps("llaisys-models")
     if has_config("nv-gpu") then
+        add_rules("cuda")
+        add_cugencodes("sm_86")
+        add_cuflags("-Xcompiler=-fPIC", {force = true})
+        add_files("src/llaisys/cuda_devlink_stub.cu")
         add_links("cudart", "cublas")
         add_linkdirs("/usr/local/cuda/lib64")
     end
