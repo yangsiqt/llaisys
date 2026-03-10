@@ -17,7 +17,9 @@ target("llaisys-ops-nvidia")
     set_languages("cxx17")
     add_cugencodes("sm_86")
     add_cuflags("-Xcompiler=-fPIC", {force = true})
+    add_cuflags("--expt-relaxed-constexpr", {force = true})
 
+    add_includedirs("../third_party/cutlass/include")
     add_links("cublas")
     add_files("../src/ops/*/nvidia/*.cu")
 
