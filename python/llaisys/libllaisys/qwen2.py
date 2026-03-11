@@ -90,3 +90,39 @@ def load_qwen2(lib):
     ]
     lib.llaisysQwen2ModelInfer.restype = c_int64
 
+    # --- Tensor Parallel API ---
+    llaisysQwen2TPModel_t = c_void_p
+
+    lib.llaisysQwen2TPModelCreate.argtypes = [
+        POINTER(LlaisysQwen2Meta),
+        llaisysDeviceType_t,
+        POINTER(c_int),
+        c_int,
+    ]
+    lib.llaisysQwen2TPModelCreate.restype = llaisysQwen2TPModel_t
+
+    lib.llaisysQwen2TPModelDestroy.argtypes = [llaisysQwen2TPModel_t]
+    lib.llaisysQwen2TPModelDestroy.restype = None
+
+    lib.llaisysQwen2TPModelSetInEmbed.argtypes = [llaisysQwen2TPModel_t, c_int, llaisysTensor_t]
+    lib.llaisysQwen2TPModelSetInEmbed.restype = None
+
+    lib.llaisysQwen2TPModelSetOutEmbed.argtypes = [llaisysQwen2TPModel_t, llaisysTensor_t]
+    lib.llaisysQwen2TPModelSetOutEmbed.restype = None
+
+    lib.llaisysQwen2TPModelSetOutNormW.argtypes = [llaisysQwen2TPModel_t, c_int, llaisysTensor_t]
+    lib.llaisysQwen2TPModelSetOutNormW.restype = None
+
+    lib.llaisysQwen2TPModelSetLayerWeight.argtypes = [llaisysQwen2TPModel_t, c_int, c_char_p, c_size_t, llaisysTensor_t]
+    lib.llaisysQwen2TPModelSetLayerWeight.restype = None
+
+    lib.llaisysQwen2TPModelInfer.argtypes = [
+        llaisysQwen2TPModel_t,
+        POINTER(c_int64),
+        c_size_t,
+    ]
+    lib.llaisysQwen2TPModelInfer.restype = c_int64
+
+    lib.llaisysQwen2TPModelGetTPSize.argtypes = [llaisysQwen2TPModel_t]
+    lib.llaisysQwen2TPModelGetTPSize.restype = c_int
+

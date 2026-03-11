@@ -1,3 +1,10 @@
+local nccl_inc = "/root/miniconda3/lib/python3.12/site-packages/nvidia/nccl/include"
+local nccl_lib = "/root/miniconda3/lib/python3.12/site-packages/nvidia/nccl/lib"
+if not os.isdir(nccl_inc) then
+    nccl_inc = "/usr/include"
+    nccl_lib = "/usr/lib/x86_64-linux-gnu"
+end
+
 target("llaisys-device-nvidia")
     set_kind("static")
     add_rules("cuda")
@@ -5,7 +12,12 @@ target("llaisys-device-nvidia")
     add_cugencodes("sm_86")
     add_cuflags("-Xcompiler=-fPIC", {force = true})
 
-    add_files("../src/device/nvidia/*.cu")
+    add_includedirs(nccl_inc)
+    add_files("../src/device/nvidia/nvidia_runtime_api.cu")
+    add_files("../src/device/nvidia/nvidia_resource.cu")
+    add_files("../src/device/nvidia/nccl_comm.cu")
+    add_linkdirs(nccl_lib)
+    add_links("nccl")
 
     on_install(function (target) end)
 target_end()

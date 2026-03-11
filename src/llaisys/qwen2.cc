@@ -173,4 +173,86 @@ int64_t llaisysQwen2ModelInfer(struct LlaisysQwen2Model *model, int64_t *token_i
     return model->model->infer(tokens);
 }
 
+// --- Tensor Parallel API ---
+
+} // extern "C"
+
+#include "../models/qwen2/qwen2_tp.hpp"
+using namespace llaisys::models;
+
+extern "C" {
+
+struct LlaisysQwen2TPModel {
+    Qwen2TPModel *model;
+};
+
+struct LlaisysQwen2TPModel *llaisysQwen2TPModelCreate(
+    const LlaisysQwen2Meta *meta,
+    llaisysDeviceType_t device,
+    int *device_ids,
+    int ndevice) {
+
+    Qwen2Config config;
+    config.dtype = meta->dtype;
+    config.nlayer = meta->nlayer;
+    config.hs = meta->hs;
+    config.nh = meta->nh;
+    config.nkvh = meta->nkvh;
+    config.dh = meta->dh;
+    config.di = meta->di;
+    config.maxseq = meta->maxseq;
+    config.voc = meta->voc;
+    config.epsilon = meta->epsilon;
+    config.theta = meta->theta;
+    config.end_token = meta->end_token;
+
+    std::vector<int> dev_ids(device_ids, device_ids + ndevice);
+
+    auto *tp_model = new LlaisysQwen2TPModel();
+    tp_model->model = new Qwen2TPModel(config, device, dev_ids);
+    return tp_model;
+}
+
+void llaisysQwen2TPModelDestroy(struct LlaisysQwen2TPModel *model) {
+    if (model) {
+        delete model->model;
+        delete model;
+    }
+}
+
+void llaisysQwen2TPModelSetInEmbed(struct LlaisysQwen2TPModel *model, int rank, llaisysTensor_t tensor) {
+    if (!model || !model->model || !tensor) return;
+    auto *t = reinterpret_cast<LlaisysTensor *>(tensor);
+    model->model->setInEmbed(rank, t->tensor);
+}
+
+void llaisysQwen2TPModelSetOutEmbed(struct LlaisysQwen2TPModel *model, llaisysTensor_t tensor) {
+    if (!model || !model->model || !tensor) return;
+    auto *t = reinterpret_cast<LlaisysTensor *>(tensor);
+    model->model->setOutEmbed(t->tensor);
+}
+
+void llaisysQwen2TPModelSetOutNormW(struct LlaisysQwen2TPModel *model, int rank, llaisysTensor_t tensor) {
+    if (!model || !model->model || !tensor) return;
+    auto *t = reinterpret_cast<LlaisysTensor *>(tensor);
+    model->model->setOutNormW(rank, t->tensor);
+}
+
+void llaisysQwen2TPModelSetLayerWeight(struct LlaisysQwen2TPModel *model, int rank, const char *name, size_t layer_idx, llaisysTensor_t tensor) {
+    if (!model || !model->model || !tensor) return;
+    auto *t = reinterpret_cast<LlaisysTensor *>(tensor);
+    model->model->setLayerWeight(rank, std::string(name ? name : ""), layer_idx, t->tensor);
+}
+
+int64_t llaisysQwen2TPModelInfer(struct LlaisysQwen2TPModel *model, int64_t *token_ids, size_t ntoken) {
+    if (!model || !model->model) return -1;
+    std::vector<int64_t> tokens(token_ids, token_ids + ntoken);
+    return model->model->infer(tokens);
+}
+
+int llaisysQwen2TPModelGetTPSize(struct LlaisysQwen2TPModel *model) {
+    if (!model || !model->model) return 0;
+    return model->model->tp_size();
+}
+
 } // extern "C"

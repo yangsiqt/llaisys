@@ -44,5 +44,19 @@ __C {
     __export void llaisysQwen2ModelSetLayerWeight(struct LlaisysQwen2Model * model, const char* name, size_t layer_idx, llaisysTensor_t tensor);
 
     __export int64_t llaisysQwen2ModelInfer(struct LlaisysQwen2Model * model, int64_t * token_ids, size_t ntoken);
+
+    // --- Tensor Parallel API ---
+    struct LlaisysQwen2TPModel;
+
+    __export struct LlaisysQwen2TPModel *llaisysQwen2TPModelCreate(const LlaisysQwen2Meta *meta, llaisysDeviceType_t device, int *device_ids, int ndevice);
+    __export void llaisysQwen2TPModelDestroy(struct LlaisysQwen2TPModel *model);
+
+    __export void llaisysQwen2TPModelSetInEmbed(struct LlaisysQwen2TPModel *model, int rank, llaisysTensor_t tensor);
+    __export void llaisysQwen2TPModelSetOutEmbed(struct LlaisysQwen2TPModel *model, llaisysTensor_t tensor);
+    __export void llaisysQwen2TPModelSetOutNormW(struct LlaisysQwen2TPModel *model, int rank, llaisysTensor_t tensor);
+    __export void llaisysQwen2TPModelSetLayerWeight(struct LlaisysQwen2TPModel *model, int rank, const char *name, size_t layer_idx, llaisysTensor_t tensor);
+
+    __export int64_t llaisysQwen2TPModelInfer(struct LlaisysQwen2TPModel *model, int64_t *token_ids, size_t ntoken);
+    __export int llaisysQwen2TPModelGetTPSize(struct LlaisysQwen2TPModel *model);
 }
 #endif // LLAISYS_MODELS_QWEN2_H

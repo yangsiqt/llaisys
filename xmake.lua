@@ -130,8 +130,14 @@ target("llaisys")
         add_cugencodes("sm_86")
         add_cuflags("-Xcompiler=-fPIC", {force = true})
         add_files("src/llaisys/cuda_devlink_stub.cu")
-        add_links("cudart", "cublas")
+        add_links("cudart", "cublas", "nccl")
         add_linkdirs("/usr/local/cuda/lib64")
+        -- Use PyTorch-bundled NCCL if available (version must match torch)
+        local nccl_lib = "/root/miniconda3/lib/python3.12/site-packages/nvidia/nccl/lib"
+        if os.isdir(nccl_lib) then
+            add_linkdirs(nccl_lib)
+            add_rpathdirs(nccl_lib)
+        end
     end
 
     set_languages("cxx17")
