@@ -24,6 +24,10 @@ jobs:
       uses: xmake-io/github-action-setup-xmake@v1
       with:
         xmake-version: latest
+
+    - name: Install OpenBLAS (Ubuntu)
+      if: matrix.os == 'ubuntu-latest'
+      run: sudo apt-get update && sudo apt-get install -y libopenblas-dev
     
     - name: Xmake Build & Install
       run: | 

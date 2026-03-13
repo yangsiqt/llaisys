@@ -1,12 +1,14 @@
+#ifdef LLAISYS_USE_OPENBLAS
 #include <immintrin.h>
 #include <omp.h>
-
-#include "linear_cpu.hpp"
-#include "../../../utils.hpp"
+#include <cblas.h>
+#endif
 
 #include <cstring>
 #include <vector>
-#include <cblas.h>
+
+#include "linear_cpu.hpp"
+#include "../../../utils.hpp"
 
 // Linear: out = in @ weight^T + bias
 // out: [batch_size, out_features]
@@ -14,6 +16,7 @@
 // weight: [out_features, in_features] (NOT transposed)
 // bias: [out_features] (optional)
 
+#ifdef LLAISYS_USE_OPENBLAS
 static void linear_f32(float *out, const float *in, const float *weight, const float *bias,
                        size_t batch_size, size_t in_features, size_t out_features) {
     int M = static_cast<int>(batch_size);
@@ -36,7 +39,24 @@ static void linear_f32(float *out, const float *in, const float *weight, const f
                     bias ? 1.0f : 0.0f, out, N);
     }
 }
+#else
+// Scalar fallback when OpenBLAS is not available (e.g. Windows CI)
+static void linear_f32(float *out, const float *in, const float *weight, const float *bias,
+                       size_t batch_size, size_t in_features, size_t out_features) {
+    for (size_t b = 0; b < batch_size; b++) {
+        for (size_t o = 0; o < out_features; o++) {
+            float sum = 0.0f;
+            for (size_t i = 0; i < in_features; i++)
+                sum += in[b * in_features + i] * weight[o * in_features + i];
+            if (bias != nullptr)
+                sum += bias[o];
+            out[b * out_features + o] = sum;
+        }
+    }
+}
+#endif
 
+#ifdef LLAISYS_USE_OPENBLAS
 static inline __m512 bf16x16_to_f32x16(const llaisys::bf16_t *src) {
     __m256i bf16_vals = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(src));
     __m512i i32_vals = _mm512_cvtepu16_epi32(bf16_vals);
@@ -73,7 +93,6 @@ static void f32_to_bf16_avx512(llaisys::bf16_t *dst, const float *src, size_t n)
 }
 
 // Fused bf16 matrix-vector multiply: out[o] = sum_i(weight[o,i] * in_f32[i])
-// Converts weight bf16->f32 on-the-fly using AVX-512, avoids materializing full weight in f32
 static void bf16_gemv_fused(float *out_f32, const llaisys::bf16_t *weight,
                             const float *in_f32, const llaisys::bf16_t *bias,
                             size_t in_features, size_t out_features) {
@@ -102,7 +121,6 @@ static void linear_bf16(llaisys::bf16_t *out, const llaisys::bf16_t *in,
                         size_t batch_size, size_t in_features, size_t out_features) {
 
     if (batch_size == 1) {
-        // Fused bf16 gemv: convert input once, stream through weight on-the-fly
         std::vector<float> in_f32(in_features);
         bf16_to_f32_avx512(in_f32.data(), in, in_features);
 
@@ -200,6 +218,26 @@ static void linear_fp16(llaisys::fp16_t *out, const llaisys::fp16_t *in,
     for (size_t i = 0; i < out_elems; i++)
         out[i] = llaisys::utils::cast<llaisys::fp16_t>(out_f32[i]);
 }
+#else
+// Scalar fallback for bf16/fp16 when OpenBLAS is not available
+template <typename T>
+static void linear_half_fallback(T *out, const T *in, const T *weight, const T *bias,
+                                 size_t batch_size, size_t in_features, size_t out_features) {
+    for (size_t b = 0; b < batch_size; b++) {
+        for (size_t o = 0; o < out_features; o++) {
+            float sum = 0.0f;
+            for (size_t i = 0; i < in_features; i++) {
+                float in_val = llaisys::utils::cast<float>(in[b * in_features + i]);
+                float w_val = llaisys::utils::cast<float>(weight[o * in_features + i]);
+                sum += in_val * w_val;
+            }
+            if (bias != nullptr)
+                sum += llaisys::utils::cast<float>(bias[o]);
+            out[b * out_features + o] = llaisys::utils::cast<T>(sum);
+        }
+    }
+}
+#endif
 
 namespace llaisys::ops::cpu {
 void linear(std::byte *out, const std::byte *in, const std::byte *weight, const std::byte *bias,
@@ -213,17 +251,35 @@ void linear(std::byte *out, const std::byte *in, const std::byte *weight, const 
                          bias ? reinterpret_cast<const float *>(bias) : nullptr,
                          batch_size, in_features, out_features);
     case LLAISYS_DTYPE_BF16:
+#ifdef LLAISYS_USE_OPENBLAS
         return linear_bf16(reinterpret_cast<llaisys::bf16_t *>(out),
                           reinterpret_cast<const llaisys::bf16_t *>(in),
                           reinterpret_cast<const llaisys::bf16_t *>(weight),
                           bias ? reinterpret_cast<const llaisys::bf16_t *>(bias) : nullptr,
                           batch_size, in_features, out_features);
+#else
+        return linear_half_fallback<llaisys::bf16_t>(
+                          reinterpret_cast<llaisys::bf16_t *>(out),
+                          reinterpret_cast<const llaisys::bf16_t *>(in),
+                          reinterpret_cast<const llaisys::bf16_t *>(weight),
+                          bias ? reinterpret_cast<const llaisys::bf16_t *>(bias) : nullptr,
+                          batch_size, in_features, out_features);
+#endif
     case LLAISYS_DTYPE_F16:
+#ifdef LLAISYS_USE_OPENBLAS
         return linear_fp16(reinterpret_cast<llaisys::fp16_t *>(out),
                           reinterpret_cast<const llaisys::fp16_t *>(in),
                           reinterpret_cast<const llaisys::fp16_t *>(weight),
                           bias ? reinterpret_cast<const llaisys::fp16_t *>(bias) : nullptr,
                           batch_size, in_features, out_features);
+#else
+        return linear_half_fallback<llaisys::fp16_t>(
+                          reinterpret_cast<llaisys::fp16_t *>(out),
+                          reinterpret_cast<const llaisys::fp16_t *>(in),
+                          reinterpret_cast<const llaisys::fp16_t *>(weight),
+                          bias ? reinterpret_cast<const llaisys::fp16_t *>(bias) : nullptr,
+                          batch_size, in_features, out_features);
+#endif
     default:
         EXCEPTION_UNSUPPORTED_DATATYPE(type);
     }
