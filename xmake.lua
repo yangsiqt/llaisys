@@ -123,6 +123,10 @@ target("llaisys")
     set_languages("cxx17")
     set_warnings("all", "error")
     add_files("src/llaisys/*.cc")
+    if not is_plat("windows") then
+        add_links("openblas", "gomp")
+        add_linkdirs("/usr/lib/x86_64-linux-gnu")
+    end
     set_installdir(".")
 
     

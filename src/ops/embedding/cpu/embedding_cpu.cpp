@@ -3,9 +3,11 @@
 #include "../../../utils.hpp"
 
 #include <cstring>
+#include <omp.h>
 
 template <typename T>
 void embedding_(T *out, const int64_t *index, const T *weight, size_t seq_len, size_t hidden_size) {
+    #pragma omp parallel for schedule(static)
     for (size_t i = 0; i < seq_len; i++) {
         int64_t idx = index[i];
         const T *src = weight + idx * hidden_size;
@@ -34,4 +36,3 @@ void embedding(std::byte *out, const std::byte *index, const std::byte *weight,
     }
 }
 } // namespace llaisys::ops::cpu
-
