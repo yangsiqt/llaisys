@@ -3,7 +3,6 @@
 #include "../../../utils.hpp"
 
 #include <cstring>
-#include <omp.h>
 
 template <typename T>
 void embedding_(T *out, const int64_t *index, const T *weight, size_t seq_len, size_t hidden_size) {

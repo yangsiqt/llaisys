@@ -3,7 +3,6 @@
 #include "../../../utils.hpp"
 
 #include <cmath>
-#include <omp.h>
 
 // RoPE: Rotary Position Embedding
 // Input shape: [seq_len, n_heads, head_dim]

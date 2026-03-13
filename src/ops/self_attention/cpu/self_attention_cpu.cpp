@@ -1,5 +1,8 @@
+#ifdef LLAISYS_USE_OPENBLAS
 #include <immintrin.h>
 #include <omp.h>
+#endif
+
 #include <cmath>
 #include <vector>
 #include <algorithm>
@@ -14,6 +17,7 @@
 // V: [kvlen, n_kv_heads, head_dim]
 // Output: [qlen, n_heads, head_dim]
 
+#ifdef LLAISYS_USE_OPENBLAS
 static inline float avx512_dot(const float *a, const float *b, size_t len) {
     __m512 sum_vec = _mm512_setzero_ps();
     size_t i = 0;
@@ -41,6 +45,14 @@ static void bf16_to_f32_fast(float *dst, const llaisys::bf16_t *src, size_t n) {
     for (; i < n; i++)
         dst[i] = llaisys::utils::cast<float>(src[i]);
 }
+#else
+static inline float scalar_dot(const float *a, const float *b, size_t len) {
+    float sum = 0.0f;
+    for (size_t i = 0; i < len; i++)
+        sum += a[i] * b[i];
+    return sum;
+}
+#endif
 
 template <typename T>
 void self_attention_(T *attn_val, const T *q, const T *k, const T *v, float scale,
@@ -48,77 +60,38 @@ void self_attention_(T *attn_val, const T *q, const T *k, const T *v, float scal
     
     size_t n_rep = n_heads / n_kv_heads;
 
-    if constexpr (std::is_same_v<T, llaisys::bf16_t>) {
+    if constexpr (std::is_same_v<T, llaisys::bf16_t> || std::is_same_v<T, llaisys::fp16_t>) {
         size_t q_elems = qlen * n_heads * head_dim;
         size_t k_elems = kvlen * n_kv_heads * head_dim;
         size_t v_elems = kvlen * n_kv_heads * head_dim;
 
         std::vector<float> q_f32(q_elems), k_f32(k_elems), v_f32(v_elems);
-        bf16_to_f32_fast(q_f32.data(), q, q_elems);
-        bf16_to_f32_fast(k_f32.data(), k, k_elems);
-        bf16_to_f32_fast(v_f32.data(), v, v_elems);
 
-        #pragma omp parallel
-        {
-            std::vector<float> scores(qlen * kvlen);
-
-            #pragma omp for schedule(dynamic)
-            for (size_t h = 0; h < n_heads; h++) {
-                size_t kv_h = h / n_rep;
-
-                for (size_t qi = 0; qi < qlen; qi++) {
-                    const float *q_ptr = q_f32.data() + qi * n_heads * head_dim + h * head_dim;
-                    size_t abs_qi = kvlen - qlen + qi;
-
-                    for (size_t ki = 0; ki < kvlen; ki++) {
-                        if (ki > abs_qi) {
-                            scores[qi * kvlen + ki] = -std::numeric_limits<float>::infinity();
-                            continue;
-                        }
-                        const float *k_ptr = k_f32.data() + ki * n_kv_heads * head_dim + kv_h * head_dim;
-                        scores[qi * kvlen + ki] = avx512_dot(q_ptr, k_ptr, head_dim) * scale;
-                    }
-
-                    float max_score = -std::numeric_limits<float>::infinity();
-                    for (size_t ki = 0; ki < kvlen; ki++)
-                        max_score = std::max(max_score, scores[qi * kvlen + ki]);
-
-                    float sum_exp = 0.0f;
-                    for (size_t ki = 0; ki < kvlen; ki++) {
-                        scores[qi * kvlen + ki] = std::exp(scores[qi * kvlen + ki] - max_score);
-                        sum_exp += scores[qi * kvlen + ki];
-                    }
-                    float inv_sum = 1.0f / sum_exp;
-                    for (size_t ki = 0; ki < kvlen; ki++)
-                        scores[qi * kvlen + ki] *= inv_sum;
-
-                    for (size_t d = 0; d < head_dim; d++) {
-                        float val = 0.0f;
-                        for (size_t ki = 0; ki < kvlen; ki++)
-                            val += scores[qi * kvlen + ki] * v_f32[ki * n_kv_heads * head_dim + kv_h * head_dim + d];
-                        attn_val[qi * n_heads * head_dim + h * head_dim + d] = llaisys::utils::cast<T>(val);
-                    }
-                }
-            }
+#ifdef LLAISYS_USE_OPENBLAS
+        if constexpr (std::is_same_v<T, llaisys::bf16_t>) {
+            bf16_to_f32_fast(q_f32.data(), q, q_elems);
+            bf16_to_f32_fast(k_f32.data(), k, k_elems);
+            bf16_to_f32_fast(v_f32.data(), v, v_elems);
+        } else {
+            for (size_t i = 0; i < q_elems; i++) q_f32[i] = llaisys::utils::cast<float>(q[i]);
+            for (size_t i = 0; i < k_elems; i++) k_f32[i] = llaisys::utils::cast<float>(k[i]);
+            for (size_t i = 0; i < v_elems; i++) v_f32[i] = llaisys::utils::cast<float>(v[i]);
         }
-    } else if constexpr (std::is_same_v<T, llaisys::fp16_t>) {
-        size_t q_elems = qlen * n_heads * head_dim;
-        size_t k_elems = kvlen * n_kv_heads * head_dim;
-        size_t v_elems = kvlen * n_kv_heads * head_dim;
-
-        std::vector<float> q_f32(q_elems), k_f32(k_elems), v_f32(v_elems);
-        #pragma omp parallel for schedule(static)
+#else
         for (size_t i = 0; i < q_elems; i++) q_f32[i] = llaisys::utils::cast<float>(q[i]);
-        #pragma omp parallel for schedule(static)
         for (size_t i = 0; i < k_elems; i++) k_f32[i] = llaisys::utils::cast<float>(k[i]);
-        #pragma omp parallel for schedule(static)
         for (size_t i = 0; i < v_elems; i++) v_f32[i] = llaisys::utils::cast<float>(v[i]);
+#endif
 
+#ifdef LLAISYS_USE_OPENBLAS
         #pragma omp parallel
         {
             std::vector<float> scores(qlen * kvlen);
-
             #pragma omp for schedule(dynamic)
+#else
+        {
+            std::vector<float> scores(qlen * kvlen);
+#endif
             for (size_t h = 0; h < n_heads; h++) {
                 size_t kv_h = h / n_rep;
 
@@ -132,7 +105,11 @@ void self_attention_(T *attn_val, const T *q, const T *k, const T *v, float scal
                             continue;
                         }
                         const float *k_ptr = k_f32.data() + ki * n_kv_heads * head_dim + kv_h * head_dim;
+#ifdef LLAISYS_USE_OPENBLAS
                         scores[qi * kvlen + ki] = avx512_dot(q_ptr, k_ptr, head_dim) * scale;
+#else
+                        scores[qi * kvlen + ki] = scalar_dot(q_ptr, k_ptr, head_dim) * scale;
+#endif
                     }
 
                     float max_score = -std::numeric_limits<float>::infinity();
@@ -158,11 +135,16 @@ void self_attention_(T *attn_val, const T *q, const T *k, const T *v, float scal
             }
         }
     } else {
+        // f32 path
+#ifdef LLAISYS_USE_OPENBLAS
         #pragma omp parallel
         {
             std::vector<float> scores(qlen * kvlen);
-
             #pragma omp for schedule(dynamic)
+#else
+        {
+            std::vector<float> scores(qlen * kvlen);
+#endif
             for (size_t h = 0; h < n_heads; h++) {
                 size_t kv_h = h / n_rep;
 
@@ -176,7 +158,11 @@ void self_attention_(T *attn_val, const T *q, const T *k, const T *v, float scal
                             continue;
                         }
                         const float *k_ptr = reinterpret_cast<const float *>(k) + ki * n_kv_heads * head_dim + kv_h * head_dim;
+#ifdef LLAISYS_USE_OPENBLAS
                         scores[qi * kvlen + ki] = avx512_dot(q_ptr, k_ptr, head_dim) * scale;
+#else
+                        scores[qi * kvlen + ki] = scalar_dot(q_ptr, k_ptr, head_dim) * scale;
+#endif
                     }
 
                     float max_score = -std::numeric_limits<float>::infinity();

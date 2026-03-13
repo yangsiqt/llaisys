@@ -1,5 +1,8 @@
+#ifdef LLAISYS_USE_OPENBLAS
 #include <immintrin.h>
 #include <omp.h>
+#endif
+
 #include <cmath>
 
 #include "add_cpu.hpp"
@@ -19,6 +22,7 @@ void add_cpu_impl(T* out, const T* a, const T* b, size_t numel) {
             out[i] = llaisys::utils::cast<T>(a_val + b_val);
         }
     } else {
+#ifdef LLAISYS_USE_OPENBLAS
         const float *fa = reinterpret_cast<const float *>(a);
         const float *fb = reinterpret_cast<const float *>(b);
         float *fo = reinterpret_cast<float *>(out);
@@ -35,6 +39,10 @@ void add_cpu_impl(T* out, const T* a, const T* b, size_t numel) {
                     fo[j] = fa[j] + fb[j];
             }
         }
+#else
+        for (size_t i = 0; i < numel; i++)
+            out[i] = a[i] + b[i];
+#endif
     }
 }
 

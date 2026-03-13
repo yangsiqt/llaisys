@@ -1,5 +1,8 @@
+#ifdef LLAISYS_USE_OPENBLAS
 #include <immintrin.h>
 #include <omp.h>
+#endif
+
 #include <cmath>
 
 #include "swiglu_cpu.hpp"
@@ -7,16 +10,6 @@
 
 // SwiGLU: out_i = up_i * SiLU(gate_i)
 // SiLU(x) = x / (1 + exp(-x))
-
-static inline __m512 avx512_silu(__m512 x) {
-    // SiLU(x) = x * sigmoid(x) = x / (1 + exp(-x))
-    // Fast approximation: compute exp(-x) via polynomial or use precise scalar fallback
-    float tmp_in[16], tmp_out[16];
-    _mm512_storeu_ps(tmp_in, x);
-    for (int i = 0; i < 16; i++)
-        tmp_out[i] = tmp_in[i] / (1.0f + std::exp(-tmp_in[i]));
-    return _mm512_loadu_ps(tmp_out);
-}
 
 template <typename T>
 void swiglu_(T *out, const T *gate, const T *up, size_t numel) {
@@ -30,6 +23,7 @@ void swiglu_(T *out, const T *gate, const T *up, size_t numel) {
             out[i] = llaisys::utils::cast<T>(up_val * silu);
         }
     } else {
+#ifdef LLAISYS_USE_OPENBLAS
         const float *g = reinterpret_cast<const float *>(gate);
         const float *u = reinterpret_cast<const float *>(up);
         float *o = reinterpret_cast<float *>(out);
@@ -40,17 +34,26 @@ void swiglu_(T *out, const T *gate, const T *up, size_t numel) {
             if (end - idx == 16) {
                 __m512 vg = _mm512_loadu_ps(g + idx);
                 __m512 vu = _mm512_loadu_ps(u + idx);
-                __m512 vsilu = avx512_silu(vg);
-                __m512 vresult = _mm512_mul_ps(vu, vsilu);
-                _mm512_storeu_ps(o + idx, vresult);
+                float tmp_in[16], tmp_out[16];
+                _mm512_storeu_ps(tmp_in, vg);
+                for (int j = 0; j < 16; j++)
+                    tmp_out[j] = tmp_in[j] / (1.0f + std::exp(-tmp_in[j]));
+                __m512 vsilu = _mm512_loadu_ps(tmp_out);
+                _mm512_storeu_ps(o + idx, _mm512_mul_ps(vu, vsilu));
             } else {
                 for (size_t j = idx; j < end; j++) {
                     float gv = g[j];
-                    float uv = u[j];
-                    o[j] = uv * (gv / (1.0f + std::exp(-gv)));
+                    o[j] = u[j] * (gv / (1.0f + std::exp(-gv)));
                 }
             }
         }
+#else
+        for (size_t i = 0; i < numel; i++) {
+            float gv = static_cast<float>(gate[i]);
+            float uv = static_cast<float>(up[i]);
+            out[i] = static_cast<T>(uv * (gv / (1.0f + std::exp(-gv))));
+        }
+#endif
     }
 }
 

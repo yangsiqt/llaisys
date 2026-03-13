@@ -1,5 +1,8 @@
+#ifdef LLAISYS_USE_OPENBLAS
 #include <immintrin.h>
 #include <omp.h>
+#endif
+
 #include <cmath>
 
 #include "rms_norm_cpu.hpp"
@@ -7,16 +10,19 @@
 
 // RMS Norm: y_i = (w_i * x_i) / sqrt(mean(x^2) + eps)
 
+#ifdef LLAISYS_USE_OPENBLAS
 static inline __m512 bf16x16_to_f32x16(const llaisys::bf16_t *src) {
     __m256i bf16_vals = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(src));
     __m512i i32_vals = _mm512_cvtepu16_epi32(bf16_vals);
     return _mm512_castsi512_ps(_mm512_slli_epi32(i32_vals, 16));
 }
+#endif
 
 template <typename T>
 void rms_norm_(T *out, const T *in, const T *weight, float eps,
                size_t batch_size, size_t hidden_size) {
     
+#ifdef LLAISYS_USE_OPENBLAS
     if constexpr (std::is_same_v<T, llaisys::bf16_t>) {
         #pragma omp parallel for schedule(static)
         for (size_t b = 0; b < batch_size; b++) {
@@ -43,7 +49,6 @@ void rms_norm_(T *out, const T *in, const T *weight, float eps,
                 __m512 vi = bf16x16_to_f32x16(in_row + i);
                 __m512 vw = bf16x16_to_f32x16(weight + i);
                 __m512 result = _mm512_mul_ps(_mm512_mul_ps(vw, vi), rms_inv_vec);
-                // Convert f32 back to bf16 with rounding
                 __m512i f32_bits = _mm512_castps_si512(result);
                 __m512i rounding = _mm512_add_epi32(
                     _mm512_set1_epi32(0x00007FFF),
@@ -108,6 +113,39 @@ void rms_norm_(T *out, const T *in, const T *weight, float eps,
                 out_row[i] = w_ptr[i] * in_row[i] * rms_inv;
         }
     }
+#else
+    // Scalar fallback
+    if constexpr (std::is_same_v<T, llaisys::bf16_t> || std::is_same_v<T, llaisys::fp16_t>) {
+        for (size_t b = 0; b < batch_size; b++) {
+            float mean_sq = 0.0f;
+            for (size_t i = 0; i < hidden_size; i++) {
+                float val = llaisys::utils::cast<float>(in[b * hidden_size + i]);
+                mean_sq += val * val;
+            }
+            mean_sq /= hidden_size;
+            float rms_inv = 1.0f / std::sqrt(mean_sq + eps);
+            for (size_t i = 0; i < hidden_size; i++) {
+                float val = llaisys::utils::cast<float>(in[b * hidden_size + i]);
+                float w = llaisys::utils::cast<float>(weight[i]);
+                out[b * hidden_size + i] = llaisys::utils::cast<T>(w * val * rms_inv);
+            }
+        }
+    } else {
+        for (size_t b = 0; b < batch_size; b++) {
+            float mean_sq = 0.0f;
+            for (size_t i = 0; i < hidden_size; i++) {
+                float val = static_cast<float>(in[b * hidden_size + i]);
+                mean_sq += val * val;
+            }
+            mean_sq /= hidden_size;
+            float rms_inv = 1.0f / std::sqrt(mean_sq + eps);
+            for (size_t i = 0; i < hidden_size; i++) {
+                out[b * hidden_size + i] = static_cast<T>(
+                    static_cast<float>(weight[i]) * static_cast<float>(in[b * hidden_size + i]) * rms_inv);
+            }
+        }
+    }
+#endif
 }
 
 namespace llaisys::ops::cpu {
