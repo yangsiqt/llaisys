@@ -244,17 +244,14 @@ class Qwen2:
         output_tokens = list(inputs)
         import sys
 
-        # print(f"[DEBUG] Starting generation with {len(output_tokens)} tokens")
         sys.stdout.flush()
 
         for i in range(max_new_tokens):
-            # print(f"[DEBUG] Step {i+1}/{max_new_tokens}")
             sys.stdout.flush()
 
             # Convert to ctypes array
             token_array = (c_int64 * len(output_tokens))(*output_tokens)
 
-            # print(f"[DEBUG] Calling C++ infer with seq_len={len(output_tokens)}")
             sys.stdout.flush()
 
             # Call inference
@@ -262,7 +259,6 @@ class Qwen2:
                 self._model, token_array, len(output_tokens)
             )
 
-            # print(f"[DEBUG] Got next_token={next_token}")
             sys.stdout.flush()
 
             # Check for end token

@@ -64,6 +64,7 @@ __C {
         size_t start,
         size_t end);
 
+    
     __export llaisysTensor_t tensorContiguous(
         llaisysTensor_t tensor);
 }
