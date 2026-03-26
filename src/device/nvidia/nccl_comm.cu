@@ -33,18 +33,24 @@ struct NcclComm::Impl {
     std::vector<int> device_ids;
     std::vector<ncclComm_t> comms;
     std::vector<cudaStream_t> streams;
+    std::vector<cudaEvent_t> compute_done_events;
+    std::vector<cudaEvent_t> nccl_done_events;
 
     Impl(const std::vector<int>& dev_ids)
         : world_size(dev_ids.size()), device_ids(dev_ids) {
 
         comms.resize(world_size);
         streams.resize(world_size);
+        compute_done_events.resize(world_size);
+        nccl_done_events.resize(world_size);
 
         NCCL_CHECK(ncclCommInitAll(comms.data(), world_size, device_ids.data()));
 
         for (int i = 0; i < world_size; i++) {
             CUDA_CHECK(cudaSetDevice(device_ids[i]));
-            CUDA_CHECK(cudaStreamCreate(&streams[i]));
+            CUDA_CHECK(cudaStreamCreateWithFlags(&streams[i], cudaStreamNonBlocking));
+            CUDA_CHECK(cudaEventCreateWithFlags(&compute_done_events[i], cudaEventDisableTiming));
+            CUDA_CHECK(cudaEventCreateWithFlags(&nccl_done_events[i], cudaEventDisableTiming));
         }
 
         std::cout << "[NCCL] Initialized " << world_size << " communicators for devices:";
@@ -55,6 +61,8 @@ struct NcclComm::Impl {
     ~Impl() {
         for (int i = 0; i < world_size; i++) {
             cudaSetDevice(device_ids[i]);
+            cudaEventDestroy(compute_done_events[i]);
+            cudaEventDestroy(nccl_done_events[i]);
             cudaStreamDestroy(streams[i]);
             ncclCommDestroy(comms[i]);
         }
@@ -74,9 +82,12 @@ struct NcclComm::Impl {
     void allreduceSum(const std::vector<void*>& bufs, size_t count, llaisysDataType_t dtype) {
         ncclDataType_t nccl_type = toNcclType(dtype);
 
+        // Record an event on the default (compute) stream of each device,
+        // then make the NCCL stream wait on it — replaces cudaDeviceSynchronize.
         for (int i = 0; i < world_size; i++) {
             CUDA_CHECK(cudaSetDevice(device_ids[i]));
-            CUDA_CHECK(cudaDeviceSynchronize());
+            CUDA_CHECK(cudaEventRecord(compute_done_events[i], nullptr));
+            CUDA_CHECK(cudaStreamWaitEvent(streams[i], compute_done_events[i], 0));
         }
 
         NCCL_CHECK(ncclGroupStart());
@@ -86,9 +97,12 @@ struct NcclComm::Impl {
         }
         NCCL_CHECK(ncclGroupEnd());
 
+        // Record completion on NCCL streams, make the default stream wait —
+        // subsequent compute kernels won't launch until AllReduce finishes.
         for (int i = 0; i < world_size; i++) {
             CUDA_CHECK(cudaSetDevice(device_ids[i]));
-            CUDA_CHECK(cudaStreamSynchronize(streams[i]));
+            CUDA_CHECK(cudaEventRecord(nccl_done_events[i], streams[i]));
+            CUDA_CHECK(cudaStreamWaitEvent(nullptr, nccl_done_events[i], 0));
         }
     }
 
