@@ -513,6 +513,66 @@ class Qwen2TP:
         print()
         return output_tokens
 
+    def generate_with_pd_metrics(
+        self,
+        inputs: Sequence[int],
+        max_new_tokens: int = None,
+        top_k: int = 1,
+        top_p: float = 0.8,
+        temperature: float = 0.8,
+    ):
+        """与 generate 相同逻辑，额外返回 prefill / decode 分段耗时（用于 benchmark）。"""
+        import sys
+        import time
+
+        if max_new_tokens is None:
+            max_new_tokens = 128
+        if top_k != 1:
+            print("Warning: Only greedy sampling (top_k=1) is currently supported")
+
+        output_tokens = list(inputs)
+        n_prompt = len(output_tokens)
+
+        t_wall0 = time.perf_counter()
+        prefill_s = 0.0
+        sum_decode_kernel_s = 0.0
+
+        for i in range(max_new_tokens):
+            token_array = (c_int64 * len(output_tokens))(*output_tokens)
+            t0 = time.perf_counter()
+            next_token = LIB_LLAISYS.llaisysQwen2TPModelInfer(
+                self._model, token_array, len(output_tokens)
+            )
+            dt = time.perf_counter() - t0
+            if i == 0:
+                prefill_s = dt
+            else:
+                sum_decode_kernel_s += dt
+            if next_token == self._config["eos_token_id"]:
+                output_tokens.append(int(next_token))
+                break
+            output_tokens.append(int(next_token))
+            if i > 0 and i % 10 == 0:
+                sys.stdout.write(f"\r[TP] Generated {i}/{max_new_tokens} tokens...")
+                sys.stdout.flush()
+
+        print()
+        t_wall1 = time.perf_counter()
+        n_gen = len(output_tokens) - n_prompt
+        total_s = t_wall1 - t_wall0
+        decode_wall_s = max(0.0, total_s - prefill_s)
+
+        metrics = {
+            "n_prompt": n_prompt,
+            "n_generated": n_gen,
+            "prefill_s": prefill_s,
+            "decode_wall_s": decode_wall_s,
+            "total_s": total_s,
+            "sum_decode_kernel_s": sum_decode_kernel_s,
+        }
+
+        return output_tokens, metrics
+
     def __del__(self):
         if hasattr(self, "_model") and self._model:
             LIB_LLAISYS.llaisysQwen2TPModelDestroy(self._model)

@@ -61,7 +61,13 @@ def load_llaisys_model(model_path, device_name) -> Qwen2:
 
 
 def llaisys_infer(
-    prompt, tokenizer, model: Qwen2, max_new_tokens=128, top_p=0.8, top_k=50, temperature=0.8
+    prompt,
+    tokenizer,
+    model: Qwen2,
+    max_new_tokens=128,
+    top_p=0.8,
+    top_k=50,
+    temperature=0.8,
 ):
     input_content = tokenizer.apply_chat_template(
         conversation=[{"role": "user", "content": prompt}],
