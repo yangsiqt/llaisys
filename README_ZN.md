@@ -391,6 +391,14 @@ python test/test_runtime.py --device nvidia
 python test/test_infer.py --model [dir_path/to/model] --test --device nvidia
 ```
 
+若已配置过 ``xmake f --nv-gpu=y``，日常在仓库根目录**编译、安装并跑端到端对比**（需本地已放置 [DeepSeek-R1-Distill-Qwen-1.5B](https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B)）可固定为：
+
+```bash
+xmake --root && xmake install --root && python test/test_infer.py --model models/DeepSeek-R1-Distill-Qwen-1.5B/ --test --device nvidia
+```
+
+BF16/F16 的 Linear：在 **m、k 为 8 倍数** 时优先 **CUTLASS TensorOp**（对真实 **n** 先尝试 **小/大 threadblock** 两套配置，decode 常见 **n=1** 可走直接 GEMM，避免旧版把 n 填成 8 带来的额外算力）；仍失败时才 **零填充 n** 再 CUTLASS；再失败则 **cuBLAS**。
+
 ## 项目#3：构建 AI 聊天机器人
 
 本项目中，你将用 LLAISYS 构建一个能与单用户实时对话的聊天机器人。
