@@ -1,431 +1,178 @@
-# Welcome to LLAISYS
+# LLM 推理系统：张量 → 算子 → 端到端 →CPU/GPU/分布式
 
-<p align="center">
-<a href="README.md" target="README.md">English</a> ｜
-<a href="README_ZN.md" target="README_ZN.md">中文</a>
-</p>
+本仓库用 **多个 Git 分支** 分别承载 **CPU 优化**、**单卡 GPU（CUTLASS + cuBLAS）** 与 **双卡张量并行（NCCL TP）**；编译与入口脚本相同，但 **请先 `git checkout` 到对应分支** 再构建，避免与代码不一致。本工程使用Python 负责编排与 HF 生态对接，经 C 接口调用 C++/CUDA；算子与推理下沉原生层，兼顾迭代效率与算力。
 
-## Introduction
+---
 
-LLAISYS (Let's Learn AI SYStem) is an educational project that aims to provide a platform for new and future AI engineers to learn how to build AI systems from scratch. LLAISYS consists of several assignments, which help students learn and build the basic modules, and projects that challenge them to add more fancy features to their systems. LLAISYS uses C++ as primary programming language for system backend, and is compiled into shared libraries exposing C language APIs. Frontend codes are written in Python which calls these APIs to provide more convenient testing and interaction with other architectures such as PyTorch.
+## 1. 概述
 
-### Project Structure Overview
+### 1.1 分支功能
 
-- `\include`: directory that contains of the header files which defines all the C APIs exposed by the shared library. (Functions declarations start with `__export`)
+| 分支 | 侧重点 | 典型场景 |
+|------|--------|----------|
+| **`feature/cpu`** | **OpenBLAS** + **OpenMP** + **AVX-512** 等 CPU 编译与 `linear` 等算子优化（`LLAISYS_USE_OPENBLAS` 等，见 `xmake/cpu.lua`） | 1.5B **纯 CPU** 端到端、`test/dzy_test_infer.py --device cpu` |
+| **`perf/cutlass`** | 引入 **`third_party/cutlass`** 头文件，NVIDIA `linear` 等与 **cuBLAS / CUTLASS** 对齐的单卡 GPU 路径；`xmake/nvidia.lua` 以 **sm_86** 等为主（适合 **RTX 3090** 一类） | 1.5B **单卡 GPU**、`dzy_test_infer.py --device nvidia` |
+| **`feature/tp`** | 在 GPU 算子线路上叠加 **NCCL**、**Megatron 式张量并行**、`Qwen2TP`、`test/tp_infer.py`；`xmake/nvidia.lua` 含 **NCCL** 与多架构（如 **sm_80、sm_86**，便于 **A800** 等） | **DeepSeek-R1-Distill-Qwen-14B**、**TP=2** 双卡 |
 
-- `\src`: C++ source files.
-  - `\src\llaisys` contains all the direct implementation of waht are defined in the header files and follows the same directory structure as the `\include`. This is also as far as C++ codes can go.
-  - other directories contain the actual implementaion of different modules.
+### 1.2 核心代码
 
-- `xmake.lua`: build rules for llaisys backend. `\xmake` directory contains the sub-xmake files for different devices. You may add `nvidia.lua` in the directory in the future for instance to support CUDA.
+| 内容 | 位置 |
+|------|------|
+| C API / 模型 | `include/llaisys/`，`src/llaisys/`，`src/models/` 等 |
+| Python 封装 | `python/llaisys/`（`Qwen2`；**`Qwen2TP` 在 `feature/tp`**） |
+| 1.5B 端到端（CPU 或单卡 GPU） | `test/dzy_test_infer.py` |
+| 14B 双卡 TP | **`feature/tp`**：`test/tp_infer.py` |
+| 构建 | `xmake.lua`，`xmake/cpu.lua`，`xmake/nvidia.lua` |
 
-- `\python`: Python source files.
-  - `\python\llaisys\libllaisys` contains all the ctypes wrapper functions of llaisys APIs. It basically matches the structure of C header files.
-  - `\python\llaisys` contains Python warppers of the ctypes functions to make the package more Python-like.
+---
 
-- `\test`: Python test files that import llaisys python package.
+## 2. 环境安装与配置
 
-## Assignment #0: Getting Started
+### 2.1 通用依赖
 
-### Task-0.1 Install Prerequisites
+- **构建**：[Xmake](https://xmake.io/)  
+- **编译器**：GCC 或 Clang（C++17）  
+- **Python**：≥ 3.9（建议 3.10+）  
+- **Python 包**：`torch`、`transformers`、`huggingface_hub`、`safetensors` 等（按本地环境安装）。
 
-- Compile Tool: [Xmake](https://xmake.io/)
-- C++ Compiler: MSVC (Windows) or Clang or GCC
-- Python >= 3.9 (PyTorch, Transformers, etc.)
-- Clang-Format-16 (Optional): for formatting C++ codes.
+### 2.2 CPU 路径（`feature/cpu`）
 
-### Task-0.2 Fork and Build LLAISYS
+- 安装 **OpenBLAS**，并保证链接期能找到库；`feature/cpu` 下 `xmake/cpu.lua` 默认示例为 Debian/Ubuntu 常见路径（`/usr/lib/x86_64-linux-gnu` 等），若路径不同需自行改 `xmake/cpu.lua` 或做软链接。  
+- 运行时用 **`OMP_NUM_THREADS`**、**`OPENBLAS_NUM_THREADS`** 与机器核心数对齐。
 
-- FORK LLAISYS Repository and Clone it to your local machine. Both Windows and Linux are supported.
+### 2.3 GPU 路径（`perf/cutlass` / `feature/tp`）
 
-- Compile and Install
+- **CUDA Toolkit**、驱动；**CUTLASS**：在含 `third_party/cutlass` 的分支上，首次克隆后需拉取子模块（见第 3 节）。  
+- **NCCL（仅 `feature/tp`）**：需开发头文件与动态库；若使用 PyPI 的 **`nvidia-nccl-cu12`** 等 wheel，运行时常需将 **`…/site-packages/nvidia/nccl/lib`** 加入 **`LD_LIBRARY_PATH`**。  
+- `feature/tp` 的 `xmake/nvidia.lua` 会尝试探测 conda 下 `nvidia/nccl`，否则回退 **`/usr/include`** 与 **`/usr/lib/x86_64-linux-gnu`**，请与机器实际安装一致。
 
-  ```bash
-  # compile c++ codes
-  xmake
-  # install llaisys shared library
-  xmake install
-  # install llaisys python package
-  pip install ./python/
-  ```
-
-- Github Auto Tests
-
-  LLAISYS uses Github Actions to run automated tests on every push and pull request. You can see testing results on your repo page. All tests should pass once you have finished all assignment tasks.
-
-### Task-0.3 Run LLAISYS for the First Time
-
-- Run cpu runtime tests
-
-  ```bash
-  python test/test_runtime.py --device cpu
-  ```
-
-  You should see the test passed.
-
-### Task-0.4 Download test model
-
-- The model we use for assignments is [DeepSeek-R1-Distill-Qwen-1.5B](https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B).
-
-- Run an inference test with the model using PyTorch
-
-  ```bash
-  python test/test_infer.py --model [dir_path/to/model]
-  ```
-
-  You can see that PyTorch is able to load the model and perform inference with the sample input. You can debug into `transformers` library codes to see how what is going on behind. Right now, your code cannot do anything yet, but you are going to build a system that can achieve the same functionality in the assignments.
-
-## Assignment #1: Tensor
-
-Tensor is a data structure that represents multi-dimensional data. It is the basic building block of LLAISYS, and most AI frameworks such as PyTorch. In this assignment, you will learn how to implement a basic tensor class.
-
-A Tensor object has the following fields:
-
-- `storage`: a shared pointer to a memory block that stores the tensor's data. It can be shared by multiple tensors. Check storage class for more details.
-- `offset`:  the starting index (in bytes) of the tensor in the storage.
-- `meta`: metadata that describes the tensor's shape, data type, and strides.
-
-Implement the following functions defined in the `src/tensor/tensor.hpp`:
-
-### Task-1.1
-
-```c++
-void load(const void *src);
-```
-
-Load host (cpu) data to the tensor (can be on device). Check contructor to see how to get runtime apis of the current device context, and do a memcpy from host to device.
-
-### Task-1.2
-
-```c++
-bool isContiguous() const; 
-```
-
-Check shape and strides of the tensor, and tell wether it is contiguous in memory.
-
-### Task-1.3
-
-```c++
-tensor_t view(const std::vector<size_t> &shape) const;
-```
-
-Create a new tensor which reshapes the original tensor to the given shape by splitting or merging the original dimensions. No data transfer is involved. For example change a tensor of shape (2, 3, 5) to (2, 15) by merging the last two dimensions.
-
-This function is not as easy as simply changing the shape of the tensor, although the test will pass. It should raise an error if new view is not compatible with the original tensor. Think about a tensor of shape (2, 3, 5) and strides (30, 10, 1). Can you still reshape it to (2, 15) without data transfer?
-
-### Task-1.4
-
-```c++
-tensor_t permute(const std::vector<size_t> &order) const;
-```
-
-Create a new tensor which changes the order of the dimensions of original tensor. Transpose can be achieved by this function without moving data around.
-
-### Task-1.5
-
-```c++
-tensor_t slice(size_t dim, size_t start, size_t end) const;
-```
-
-Create a new tensor which slices the original tensor along the given dimension,
-start (inclusive) and end (exclusive) indices.
-
-### Task-1.6
-
-Run tensor tests.
+### 2.4 模型下载（可选镜像）
 
 ```bash
-python test/test_tensor.py
+mkdir -p /path/to/models
+export HF_ENDPOINT=https://hf-mirror.com
+python -c "
+from huggingface_hub import snapshot_download
+snapshot_download(
+    'deepseek-ai/DeepSeek-R1-Distill-Qwen-14B',
+    local_dir='/path/to/models/DeepSeek-R1-Distill-Qwen-14B',
+    resume_download=True,
+)
+"
 ```
 
-You should see all tests passed. Commit and push your changes. You should see the auto tests for assignment #1 passed.
+1.5B模型 将 repo id 换为 `deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B` 即可。
 
-## Assignment #2: Operators
+---
 
-In this assignment, you will implement the cpu verision the following operators:
+## 3. 编译与安装
 
-- argmax
-- embedding
-- linear
-- rms_norm
-- rope
-- self_attention
-- swiglu
+**务必先切换到目标分支**，再在仓库根目录执行。
 
-Read the codes in `src/ops/add/` to see how "add" operator is implemented. Make sure you understand how the operator codes are organized, compiled, linked, and exposed to Python frontend. **Your operators should at least support Float32, Float16 and BFloat16 data types**. A helper function for naive type casting is provided in `src/utils/`. All python tests are in `test/ops`, you implementation should at least pass these tests. Try running the test script for "add" operator for starting.
-
-### Task-2.1 argmax
-
-```c++
-void argmax(tensor_t max_idx, tensor_t max_val, tensor_t vals);
-```
-
-Get the max value and its index of tensor `vals`, and store them in `max_val` and `max_idx` respectively. You can assume that `vals` is a 1D tensor for now, and `max_idx` and `max_val` are both 1D tensors with a single element (, which means the dimension of `vals` is kept).
-
-You should be able to pass the test cases in `test/ops/argmax.py` after you finish the implementation.
-
-### Task-2.2 embedding
-
-```c++
-void embedding(tensor_t out, tensor_t index, tensor_t weight);
-```
-
-Copy the rows in `index` (1-D) from `weight` (2-D) to `output` (2-D). `index` must be of type Int64 (the default data type for int of PyTorch).
-
-You should be able to pass the test cases in `test/ops/embedding.py` after you finish the implementation.
-
-### Task-2.3 linear
-
-```c++
-void linear(tensor_t out, tensor_t in, tensor_t weight, tensor_t bias);
-```
-
-Compute the following:
-
-$$
-Y = xW^T + b
-$$
-
-- `out`: output $Y$ . You can assume output is a 2D contiguous tensor  and no broadcasting is involved for now.
-- `input`: input $X$ . You can assume input is a 2D contiguous tensor  and no broadcasting is involved for now.
-- `weight`: weight $W$ . 2D contiguous tensor. Note that weight tensor is not transposed. You need to deal with this during your calculation.
-- `bias` (optional): bias $b$ . 1D tensor. You need to support the situation where bias is not provided.
-
-You should be able to pass the test cases in `test/ops/linear.py` after you finish the implementation.
-
-### Task-2.4 rms normalization
-
-```c++
-void rms_norm(tensor_t out, tensor_t in, tensor_t weight, float eps);
-```
-
-Compute the following for each row:
-
-$$
-Y_i = \frac{W_i \times  X_i}{\sqrt{\frac{1}{d}(\sum_{j=1}^d X_j^2) + \epsilon}}
-$$
-
-- `out`: output $Y$ . You can assume output is a 2D contiguous tensor and no broadcasting is involved for now.
-- `input`: input $X$ . You can assume input is a 2D contiguous tensor and no broadcasting is involved for now. The normalization is performed along the last dimension (a.k.a. each row of length $d$ ) of the input tensor.
-- `weight`: weight $W$ . 1D tensor, same length as a row of input tensor.
-- `eps`: small value $\epsilon$ to avoid division by zero.
-
-You should be able to pass the test cases in `test/ops/rms_norm.py` after you finish the implementation.
-
-### Task-2.5 rope
-
-```c++
-void rope(tensor_t out, tensor_t in, tensor_t pos_ids, float theta);
-```
-
-Compute the following for each vector of input tensor `in`, corresponding to a position id in `pos_ids`:
-
-Let $\mathbf{x}_i = [\mathbf{a}_i, \mathbf{b}_i] \in \mathbb{R}^d$ be the input vector and $\mathbf{y}_i = [\mathbf{a}'_i, \mathbf{b}'_i] \in \mathbb{R}^d$ be the output vector at index $i$, where $\mathbf{a}_i, \mathbf{b}_i,\mathbf{a}'_i, \mathbf{b}'_i \in \mathbb{R}^{d/2}$ .
-
-Let $\theta$ be a fixed base (e.g. $\theta = 10000$) and $j = 0, 1, \ldots, d/2 - 1$.
-
-Let $p_i \in \mathbb{N}$ is the position id for token at input index i.
-
-Then the angle for RoPE is $\phi_{i,j} = \frac{p_i}{\theta^{2j/d}}$
-
-The output vector $\mathbf{y}_i = [\mathbf{a}'_i, \mathbf{b}'_i]$ is computed as follows:
-
-$$a_{i,j}' = a_{i,j} \cos(\phi_{i,j}) - b_{i,j} \sin(\phi_{i,j})$$
-
-$$b_{i,j}' = b_{i,j} \cos(\phi_{i,j}) + a_{i,j} \sin(\phi_{i,j})$$
-
-- `out`: the resulting **q** or **k** tensor. Shape should be [seqlen, nhead, d] or [seqlen, nkvhead, d]. You can assume that the tensor is contiguous for now.
-- `in`: the orignal **q** or **k** tensor. Shape should be [seqlen, nhead, d] or [seqlen, nkvhead, d]. You can assume that the tensor is contiguous for now.
-- `pos_ids`: the position id (index in the whole context) for each token in the input sequence. Shape should be [seqlen,], dtype should be int64.
-- `theta`: the base value for the frequency vector.
-
-You should be able to pass the test cases in `test/ops/rope.py` after you finish the implementation.
-
-### Task-2.6 self-attention
-
-```c++
-void self_attention(tensor_t attn_val, tensor_t q, tensor_t k, tensor_t v, float scale);
-```
-
-Compute the self-attention for query tensor `q`, key tensor `k`, and value tensor `v`. You should concat kvcache tensors, if needed, before doing this calculation.
-
-$$
-A = Q K^\top * scale \\
-$$
-
-$$
-Y = \mathrm{causalsoftmax}(A) \cdot V \\
-$$
-
-- `attn_val`: the resulting attention value tensor. Shape should be [seqlen, nhead, dv]. You can assume that the tensor is contiguous for now.
-- `q`: the query tensor. Shape should be [seqlen, nhead, d]. You can assume that the tensor is contiguous for now.
-- `k`: the key tensor. Shape should be [total_len, nkvhead, d]. You can assume that the tensor is contiguous for now.
-- `v`: the value tensor. Shape should be [total_len, nkvhead, dv]. You can assume that the tensor is contiguous for now.
-- `scale`: a scaling factor. It is set to $\frac{1}{\sqrt{d}}$ in most cases.
-
-You should be able to pass the test cases in `test/ops/self_attention.py` after you finish the implementation.
-
-### Task-2.7 swiglu
-
-```c++
-void swiglu(tensor_t out, tensor_t gate, tensor_t up);
-```
-
-This is an element-wise function that computes the following:
-
-$$
-out_{i} = up_{i} \circ \frac { gate_{i}}{1 + e^{-gate_{i}}}
-$$
-
-`out`, `up` and `gate` are 2D contiguous tensors with the same shape [seqlen, intermediate_size].
-
-You should be able to pass the test cases in `test/ops/swiglu.py` after you finish the implementation.
-
-### Task-2.8
-
-Run operator tests.
+### 3.1 开启 CUDA（`perf/cutlass` 或 `feature/tp`）
 
 ```bash
-python test/test_ops.py
+cd /path/to/llaisys
+git checkout perf/cutlass   # 或: git checkout feature/tp
+xmake f --nv-gpu=y -cv --root
+xmake --root
+xmake install --root
+pip install ./python/
 ```
 
-You should see all tests passed. Commit and push your changes. You should see the auto tests for assignment #2 passed.
-
-### Task-2.9 (Optional) rearrange
-
-This is a bonus task. You may or may not need it for model inference.
-
-```c++
-void rearrange(tensor_t out, tensor_t in);
-```
-
-This operator is used to copy data from a tensor to another tensor with the same shape but different strides. With this, you can easily implement `contiguous` functionality for tensors.
-
-## Assignment #3: Large Language Model Inference
-
-Finally, it is the time for you to achieve text generation with LLAISYS.
-
-- In `test/test_infer.py`, your implementation should be able to generate the same texts as PyTorch, using argmax sampling. The model we use for this assignment is [DeepSeek-R1-Distill-Qwen-1.5B](https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B).
-
-- The python wrapper of your implementation is in `python/llaisys/models/qwen2.py`. You are NOT allowed to implement your model infer logic here using any python based frameworks, such as PyTorch. Instead, you need to implement the model with C/C++ in LLAISYS backend. The script loads each tensor in the safetensors file, and you will need to load data from them into your model backend.
-
-- In `include/llaisys/models/qwen2.h`, a prototype is defined for you. Feel free to modify the codes as you want, but you should at least provide basic APIs for model creation, destruction, data loading, and infer. Implement your C APIs in `src/llaisys/` and organize your C++ codes as other modules in `src/`. Remember to define the compiling procedures in `xmake.lua`.
-
-- In `python/llaisys/libllaisys/`, define the ctypes wrapper functions for your C APIs. Implement `python/llaisys/models/qwen2.py` with your wrapper functions.
-
-- You need to implement KV Cache, or your model will be too slow.
-
-- Debug until your model works. Take advantage of tensor's `debug` function which prints the tensor data. It allows you to compare the data of any tensor during the model inference with PyTorch.
-
-After you finish the implementation, you can run the following command to test your model:
+### 3.2 仅 CPU（`feature/cpu`）
 
 ```bash
-python test/test_infer.py --model [dir_path/to/model] --test
+cd /path/to/llaisys
+git checkout feature/cpu
+xmake f -c
+xmake f --nv-gpu=n
+xmake --root
+xmake install --root
+pip install ./python/
 ```
 
-Commit and push your changes. You should see the auto tests for assignment #3 passed.
+---
 
+## 4. 运行
 
-## You can proceed to the projects only after you finish the assignments.
+### 4.1 CPU：DeepSeek-R1-Distill-Qwen-1.5B（`feature/cpu`）
 
-## Project #1: Optimize LLAISYS for CPU
-You probably have already noticed that your model inference is very slow compared to PyTorch. This is mostly because your operators are not optimized. Run your operater test scripts with "--profile" flag to see how your operators perform. You would probably see that `linear` operation is much slower than PyTorch. This operator is mainly a matrix multiplication, and is the most time consuming operation in transformer-based models.
-
-There are several ways to optimize your operators for CPU:
-
-### SIMD instructions
-
-SIMD (Single Instruction Multiple Data) instructions are instructions that can perform the same operation on multiple data elements in a single instruction. Modern CPUs have support for SIMD instructions. Look for online materials to learn about compiler intrinsics (such as AVX2, AVX-512, NEON, SVE) to vectorize your operations.
-
-### Use OpenMP for parallelism
-
-You can use multi-threading to parallelize your operators. OpenMP is a popular library for multi-threading in C/C++. Add OpenMP support for LLAISYS to parallelize your `linear` and other operators.
-
-### 3rd-party Libraries
-
-There are several libraries that can help you optimize your operators for CPU. Look for libraries like Eigen, OpenBLAS, MKL, etc. to optimize your linear algebra operations. Note that some libraries are supported only for certain hardware platforms. Check their documentations and use them in your codes with care. You can also try to dig out how PyTorch implement these operators and see if you can use them.
-
-Optimize your implementation with any methods you like and report your performance improvement.
-
-## Project #2: Intigrate CUDA into LLAISYS
-
-This project does not depend on **Project #1**. You should choose two CUDA/CUDA-ish hardware platforms from Nvidia, Iluvatar, Metax, and Moore Threads.
-
-This camp session provides computation resources from the four platforms above, access to which is granted based on applications from the official website. You can accelerate your model with CUDA on these GPU platforms. Before doing that, let's dive deeper into LLAISYS framework. 
-
-LLAISYS is actually a framework with homogeous hardware support. When using LLAISYS, each thread will create a thread-local `Context` object which manages all the device `Runtime` objects used by this thread. A `Runtime` object is a resource manager for a device, and `Context` will create (with lazy initialization) a single `Runtime` object for each device. You can set and switch between them using `setDevice` function in `Context`. Only one device will be active at a time for each thread. Check `src/core/context.hpp` for more details. 
-
-### Implement CUDA Runtime APIs
-Each `Runtime` object is intialized with a set of generic functions called `Runtime APIs`. You will need to implement CUDA version of these APIS. Check `src/device/cpu/cpu_runtime_api.cpp` to see how these functions are implemented for CPU and look for CUDA APIs to use in [`CUDA Runtime documentation`](https://docs.nvidia.com/cuda/cuda-runtime-api/index.html).
-
-You can see in `src/device/runtime_api.hpp` that `nvidia::getRuntimeAPI()` is guarded by `ENABLE_NVIDIA_API` macro.
-
-```c++
-#ifdef ENABLE_NVIDIA_API
-namespace nvidia {
-const LlaisysRuntimeAPI *getRuntimeAPI();
-}
-#endif
-```
-
-This macro is defined in `xmake.lua` as a switch to enable/disable CUDA support. CUDA codes will not be compiled if the switch is off. In `xmake/` directory, create a `nvidia.lua` that configs your compiling process. (Similar to `cpu.lua` for CPU.) Search online to learn how to do it with Xmake.
-
-After you implement the CUDA Runtime APIs, config your xmake with `--nv-gpu=y` to enable CUDA support and recompile your program. Run runtime tests to see if your implementation works.
+`--test` 下脚本会将采样设为确定性配置（见 `test/dzy_test_infer.py`）。
 
 ```bash
-xmake f --nv-gpu=y -cv
-xmake
-xmake install
-python test/test_runtime.py --device nvidia
+git checkout feature/cpu
+# … 按 3.2 节完成仅 CPU 构建与 pip install …
+
+cd /path/to/llaisys
+python test/dzy_test_infer.py --model /path/to/DeepSeek-R1-Distill-Qwen-1.5B/ --test --device cpu
 ```
 
-### Implement CUDA Operators
-Create a `nvdia/` sub-directory in each operator source directory and implement a cuda version. Check `src/ops/add/op.cpp` to see how to include your cuda implementations. Remeber to define the compiling procedures in the xmake files. Run the operator tests with `--device nvidia` flag to test your CUDA implementation.
+### 4.2 单卡 GPU（RTX 3090 等）：同一 1.5B 脚本（`perf/cutlass` 或 `feature/tp`）
 
-You can use CUDA libraries like cuBLAS, cuDNN, etc. to accelerate your operators. Check their documentations to see how to use them. You can store extra device resources in `src/device/nvidia/nvidia_resource.cu`.
-
-Modify your model codes to support CUDA inference. 
+使用 CUDA 构建后，指定 **`--device nvidia`**（模型路径按本机修改，下例为相对目录）：
 
 ```bash
-python test/test_infer.py --model [dir_path/to/model] --test --device nvidia
+git checkout perf/cutlass   # 或 feature/tp（单卡可不跑 TP，仅跑 Qwen2）
+# … 按 3.1 节完成 CUDA 构建与 pip install …
+
+cd /path/to/llaisys
+python test/dzy_test_infer.py --model models/DeepSeek-R1-Distill-Qwen-1.5B/ --test --device nvidia
 ```
 
-## Project #3: Build an AI chatbot
+### 4.3 双卡张量并行：14B + `test/tp_infer.py`（**仅 `feature/tp`**）
 
-In this project you will build an AI chatbot that can do live conversations with single user with LLAISYS. 
+环境示例：**2×A800 NVLink**，模型 **DeepSeek-R1-Distill-Qwen-14B**，**TP=2**。需保证运行时能加载 **NCCL**：
 
-### Random Sampling
+```bash
+git checkout feature/tp
+# … 按 3.1 节完成 CUDA + NCCL 构建与 pip install …
 
-So far we have been testing our model with argmax sampling. This is good enough for testing, but a chatbot should be able to generate more natural responses. Implement a random sample operator. Try to add supports for **Temperature**, **Top-K** and **Top-P**.
+cd /home/dzy/za/llaisys
+export LD_LIBRARY_PATH=/root/miniconda3/lib/python3.12/site-packages/nvidia/nccl/lib:$LD_LIBRARY_PATH
+python test/tp_infer.py \
+  --model /root/autodl-tmp/models/DeepSeek-R1-Distill-Qwen-14B \
+  --test \
+  --device_ids 0,1
+```
 
-### Build a Chatbot Server
+（将 `LD_LIBRARY_PATH`、`--model` 换成你机器上的 **conda/site-packages** 与模型绝对路径即可。）
 
-In your Python frontend, implement a server that can receive http requests from user and send responses back. You can use frameworks like FastAPI to build the server. You should follow the OpenAI chat-completion APIs. Try to support streaming responses if you can. You can assume, for now, that the server is only serving one user, and block the endpoint until the previous request is served.
+常用参数见 `test/tp_infer.py`：`--prompt`、`--max_steps`、`--device_ids`。脚本会输出 **prefill / decode 速度、**decode（仅内核累计）** 及 **nvidia-smi 轮询峰值显存**。
 
+---
 
-### Interactive Chat UI
+## 5. 结果与性能
 
-Build a UI that send requests to and receive responses from the chatbot server. You can build a simple command-line interface or a fancy web interface. You should be able to keep a conversation going with the chatbot by sending messages and receiving responses consecutively.
+### 5.1 CPU：1.5B（`feature/cpu`，128 tokens 量级）
 
-### (Optional) Chat Session Management
+| 指标 | 优化前（标量/基线） | 优化后 | 提升（约） |
+|------|---------------------|--------|------------|
+| 端到端生成耗时（同脚本配置） | ~514 s | **~7.4–7.9 s**（约 **7.37 s / 7.86 s**） | **~65×–71×** |
+| 每 token 平均延时（同口径） | ~4.0 s | ~0.06 s | 同量级 |
 
-In real-world AI applications, users are allowed to start new conversations and switch between them. Users can also edit a past question and let the AI regenerate an answer. Enhance your UI to support these features. Implement a KV-Cache pool with prefix matching to reuse past results as much as possible.
+**硬件参考**：Intel Xeon Platinum 8358P @ 2.60GHz，**15 vCPU**，内存约 90GB。
 
+### 5.2 GPU：单卡 LLAISYS vs HuggingFace BF16（**RTX 3090**，简历口径）
 
-## Project #4: Multi-user Inference Service
+| 项 | LLAISYS | HuggingFace BF16 参考 |
+|----|---------|------------------------|
+| 端到端耗时（同任务设定） | **~0.8 s** | ~3.2 s |
+| 峰值显存（LLAISYS 侧） | **~7.5 GB** | （对比用） |
+| 吞吐（示例） | prefill **~692 tok/s**，decode **~98 tok/s** | — |
 
-You need to finish **Project #2** and achieve streaming response first before proceeding to this project.
+运行方式见 **§4.2**（`dzy_test_infer.py --device nvidia`）。
 
-### Serving Multiple Users
+### 5.3 双卡 TP：14B（**2×A800 NVLink**，`feature/tp`，`test/tp_infer.py` **PD 统计**）
 
-In real-world scenarios, an inference service will serve multiple users. Requests can come in at any time, and the service should be able to handle them concurrently. Your endpoint should add a new request to a request pool or queue and have a another looping process or thread to serve the requests. 
+**配置**：DeepSeek-R1-Distill-Qwen-14B，**TP=2**，`--test`；命令见 **§4.3**。
 
-### Continous Batching
-To maximize the throughput of your inference service, you need to batch your requests instead of serving them one by one. Since each request can have different length, you will need a continous and iteration-level batching mechanism. For each interation you extract several requests from pool to form a batch, do one round of batch inference, and then return the unfinished requests back to the pool. Use batched matrix multiplication when possible to speed up your inference. Note that every request in the batch need to bind with a different KV-Cache. You should build a KV-Cache pool with prefix matching to reuse past results as much as possible.
+| 指标 | 数值（本次实测） |
+|------|------------------|
+| **Prefill** | **~25.7 tok/s**（**9** 个 prompt token，约 **0.35 s**） |
+| **Decode（墙钟）** | **~22.6 tok/s**（**81** 个生成 token，约 **3.59 s**） |
+| **Decode（仅内核累计 / 脚本「decode(仅内核累计)」口径）** | **~22.3 tok/s**（**80** steps，约 **3.59 s**） |
+| **显存峰值（nvidia-smi 轮询）** | **GPU0 ~17125 MiB**，**GPU1 ~15639 MiB** |
 
-## Project #5: Distributed Inference
-Introduce Tensor Parallelism to LLAISYS. Shard your model across multiple devices and implement distributed model inference. Support NCCL in LLAISYS if your are uing Nvidia GPUs, or MPI if you are using CPUs.
+---
 
-## Project #6: Support New Models
-
-Support another model type than the one we use for homework in LLAISYS.
