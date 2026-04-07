@@ -30,14 +30,16 @@
 
 ### 2.1 通用依赖
 
+- **系统**：Ubuntu 22.04  
 - **构建**：[Xmake](https://xmake.io/)  
 - **编译器**：GCC 或 Clang（C++17）  
-- **Python**：≥ 3.9（建议 3.10+）  
-- **Python 包**：`torch`、`transformers`、`huggingface_hub`、`safetensors` 等（按本地环境安装）。
+- **Python**：3.12.3（conda base 实测）  
+- **Python 包**：`torch` 2.8.0+cu128，`transformers` 5.2.0，`huggingface_hub` 1.5.0，`safetensors` 0.7.0  
+- **CUDA**：12.8（与上述 `torch` wheel 一致）
 
 ### 2.2 CPU 路径（`feature/cpu`）
 
-- 安装 **OpenBLAS**，并保证链接期能找到库；`feature/cpu` 下 `xmake/cpu.lua` 默认示例为 Debian/Ubuntu 常见路径（`/usr/lib/x86_64-linux-gnu` 等），若路径不同需自行改 `xmake/cpu.lua` 或做软链接。  
+- 安装 **OpenBLAS**，并保证链接期能找到库；`feature/cpu` 下 `xmake/cpu.lua` 默认示例为 Ubuntu 常见路径（`/usr/lib/x86_64-linux-gnu` 等），若路径不同需自行改 `xmake/cpu.lua` 或做软链接。  
 - 运行时用 **`OMP_NUM_THREADS`**、**`OPENBLAS_NUM_THREADS`** 与机器核心数对齐。
 
 ### 2.3 GPU 路径（`perf/cutlass` / `feature/tp`）
@@ -136,8 +138,6 @@ python test/tp_infer.py \
   --device_ids 0,1
 ```
 
-（将 `LD_LIBRARY_PATH`、`--model` 换成你机器上的 **conda/site-packages** 与模型绝对路径即可。）
-
 常用参数见 `test/tp_infer.py`：`--prompt`、`--max_steps`、`--device_ids`。脚本会输出 **prefill / decode 速度、**decode（仅内核累计）** 及 **nvidia-smi 轮询峰值显存**。
 
 ---
@@ -146,22 +146,23 @@ python test/tp_infer.py \
 
 ### 5.1 CPU：1.5B（`feature/cpu`，128 tokens 量级）
 
-| 指标 | 优化前（标量/基线） | 优化后 | 提升（约） |
-|------|---------------------|--------|------------|
-| 端到端生成耗时（同脚本配置） | ~514 s | **~7.4–7.9 s**（约 **7.37 s / 7.86 s**） | **~65×–71×** |
-| 每 token 平均延时（同口径） | ~4.0 s | ~0.06 s | 同量级 |
-
+**配置**：模型 **DeepSeek-R1-Distill-Qwen-1.5B**，分支 **`feature/cpu`**，`--test`，`--device cpu`；运行方式见 **§4.1**。  
 **硬件参考**：Intel Xeon Platinum 8358P @ 2.60GHz，**15 vCPU**，内存约 90GB。
 
-### 5.2 GPU：单卡 LLAISYS vs HuggingFace BF16（**RTX 3090**，简历口径）
+| 指标 | 优化前 | 优化后 | 提升（约） |
+|------|---------------------|--------|------------|
+| 端到端生成耗时 | ~514 s | **~7.4–7.9 s** | **~65×–71×** |
+| 每 token 平均延时（同口径） | ~4.0 s | ~0.06 s | 同量级 |
+
+### 5.2 GPU：单卡 LLAISYS vs HuggingFace BF16（**RTX 3090**）
+
+**配置**：模型 **DeepSeek-R1-Distill-Qwen-1.5B**，分支 **`perf/cutlass` 或 `feature/tp`**（单卡），`--test`，`--device nvidia`，`test/dzy_test_infer.py`；运行方式见 **§4.2**。
 
 | 项 | LLAISYS | HuggingFace BF16 参考 |
 |----|---------|------------------------|
 | 端到端耗时（同任务设定） | **~0.8 s** | ~3.2 s |
-| 峰值显存（LLAISYS 侧） | **~7.5 GB** | （对比用） |
-| 吞吐（示例） | prefill **~692 tok/s**，decode **~98 tok/s** | — |
-
-运行方式见 **§4.2**（`dzy_test_infer.py --device nvidia`）。
+| 峰值显存（LLAISYS 侧） | **~7.5 GB** | — |
+| 吞吐 | prefill **~692 tok/s**，decode **~98 tok/s** | — |
 
 ### 5.3 双卡 TP：14B（**2×A800 NVLink**，`feature/tp`，`test/tp_infer.py` **PD 统计**）
 
@@ -170,9 +171,9 @@ python test/tp_infer.py \
 | 指标 | 数值（本次实测） |
 |------|------------------|
 | **Prefill** | **~25.7 tok/s**（**9** 个 prompt token，约 **0.35 s**） |
-| **Decode（墙钟）** | **~22.6 tok/s**（**81** 个生成 token，约 **3.59 s**） |
-| **Decode（仅内核累计 / 脚本「decode(仅内核累计)」口径）** | **~22.3 tok/s**（**80** steps，约 **3.59 s**） |
-| **显存峰值（nvidia-smi 轮询）** | **GPU0 ~17125 MiB**，**GPU1 ~15639 MiB** |
+| **Decode** | **~22.6 tok/s**（**81** 个生成 token，约 **3.59 s**） |
+| **Decode** | **~22.3 tok/s**（**80** steps，约 **3.59 s**） |
+| **显存峰值** | **GPU0 ~17125 MiB**，**GPU1 ~15639 MiB** |
 
 ---
 
