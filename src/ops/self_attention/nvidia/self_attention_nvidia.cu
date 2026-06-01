@@ -313,7 +313,8 @@ __global__ void self_attn_paged_slots_decode_kernel(T *attn_val, const T *q, con
     float *const K_tile = reinterpret_cast<float *>(smem_u);
     float *const V_tile = K_tile + BR * head_dim;
     float *const S_tile = V_tile + BR * head_dim;
-    float *const Q_tile = S_tile + BR;
+    int64_t *const B_tile = reinterpret_cast<int64_t *>(S_tile + BR);
+    float *const Q_tile = reinterpret_cast<float *>(B_tile + BR);
     float *const O_acc = Q_tile + head_dim;
 
     for (size_t d = tid; d < head_dim; d += blockDim.x)
@@ -327,13 +328,18 @@ __global__ void self_attn_paged_slots_decode_kernel(T *attn_val, const T *q, con
 
     for (int k0 = 0; k0 < (int)kv_len; k0 += BR) {
         const int tile_len = min(BR, (int)kv_len - k0);
+        for (int b = tid; b < tile_len; b += blockDim.x) {
+            const size_t ki = (size_t)k0 + (size_t)b;
+            const size_t logical_block = ki / block_size;
+            B_tile[b] = block_tables[slot_id * max_blocks_per_slot + logical_block];
+        }
+        __syncthreads();
         for (int idx = tid; idx < tile_len * (int)head_dim; idx += blockDim.x) {
             const int b = idx / (int)head_dim;
             const int d = idx % (int)head_dim;
             const size_t ki = (size_t)k0 + (size_t)b;
-            const size_t logical_block = ki / block_size;
             const size_t block_offset = ki % block_size;
-            const int64_t physical_block = block_tables[slot_id * max_blocks_per_slot + logical_block];
+            const int64_t physical_block = B_tile[b];
             float kval = 0.f, vval = 0.f;
             if (physical_block >= 0) {
                 const size_t off = (((size_t)physical_block * block_size + block_offset) * n_kv_heads + kv_h) *
@@ -395,7 +401,8 @@ static void launch_paged_slots_decode(T *attn_val, const T *q, const T *k_cache,
     const int blocks = (int)(batch_size * n_heads);
     const int threads = 256;
     const size_t smem_bytes =
-        (size_t)BR * head_dim * sizeof(float) * 2 + (size_t)BR * sizeof(float) + head_dim * sizeof(float) * 2;
+        (size_t)BR * head_dim * sizeof(float) * 2 + (size_t)BR * sizeof(float) +
+        (size_t)BR * sizeof(int64_t) + head_dim * sizeof(float) * 2;
     if (smem_bytes > 48u * 1024u) {
         cudaFuncSetAttribute(self_attn_paged_slots_decode_kernel<T, BR>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);
@@ -717,12 +724,55 @@ void self_attention_paged_slots_decode(std::byte *attn_val, const std::byte *q,
                                        size_t batch_size, size_t max_blocks_per_slot,
                                        size_t block_size, size_t n_heads, size_t n_kv_heads,
                                        size_t head_dim) {
-    const size_t smem_br64 =
-        64u * head_dim * sizeof(float) * 2 + 64u * sizeof(float) + head_dim * sizeof(float) * 2;
-    const size_t smem_br32 =
-        32u * head_dim * sizeof(float) * 2 + 32u * sizeof(float) + head_dim * sizeof(float) * 2;
-    const bool use_br64 = head_dim == 128 && smem_br64 <= 96u * 1024u;
-    if (use_br64) {
+    int forced_br = 0;
+    if (const char *env = std::getenv("LLAISYS_PAGED_ATTN_BR")) {
+        forced_br = std::atoi(env);
+    }
+    if (forced_br == 16) {
+        switch (type) {
+        case LLAISYS_DTYPE_F32:
+            return launch_paged_slots_decode<float, 16>((float *)attn_val, (const float *)q,
+                                                        (const float *)k_cache, (const float *)v_cache,
+                                                        block_tables, slot_ids, seq_lens, scale, batch_size,
+                                                        max_blocks_per_slot, block_size, n_heads, n_kv_heads,
+                                                        head_dim);
+        case LLAISYS_DTYPE_BF16:
+            return launch_paged_slots_decode<__nv_bfloat16, 16>(
+                (__nv_bfloat16 *)attn_val, (const __nv_bfloat16 *)q, (const __nv_bfloat16 *)k_cache,
+                (const __nv_bfloat16 *)v_cache, block_tables, slot_ids, seq_lens, scale, batch_size,
+                max_blocks_per_slot, block_size, n_heads, n_kv_heads, head_dim);
+        case LLAISYS_DTYPE_F16:
+            return launch_paged_slots_decode<__half, 16>((__half *)attn_val, (const __half *)q,
+                                                        (const __half *)k_cache, (const __half *)v_cache,
+                                                        block_tables, slot_ids, seq_lens, scale, batch_size,
+                                                        max_blocks_per_slot, block_size, n_heads, n_kv_heads,
+                                                        head_dim);
+        default: break;
+        }
+    }
+    if (forced_br == 32) {
+        switch (type) {
+        case LLAISYS_DTYPE_F32:
+            return launch_paged_slots_decode<float, 32>((float *)attn_val, (const float *)q,
+                                                        (const float *)k_cache, (const float *)v_cache,
+                                                        block_tables, slot_ids, seq_lens, scale, batch_size,
+                                                        max_blocks_per_slot, block_size, n_heads, n_kv_heads,
+                                                        head_dim);
+        case LLAISYS_DTYPE_BF16:
+            return launch_paged_slots_decode<__nv_bfloat16, 32>(
+                (__nv_bfloat16 *)attn_val, (const __nv_bfloat16 *)q, (const __nv_bfloat16 *)k_cache,
+                (const __nv_bfloat16 *)v_cache, block_tables, slot_ids, seq_lens, scale, batch_size,
+                max_blocks_per_slot, block_size, n_heads, n_kv_heads, head_dim);
+        case LLAISYS_DTYPE_F16:
+            return launch_paged_slots_decode<__half, 32>((__half *)attn_val, (const __half *)q,
+                                                        (const __half *)k_cache, (const __half *)v_cache,
+                                                        block_tables, slot_ids, seq_lens, scale, batch_size,
+                                                        max_blocks_per_slot, block_size, n_heads, n_kv_heads,
+                                                        head_dim);
+        default: break;
+        }
+    }
+    if (forced_br == 64) {
         switch (type) {
         case LLAISYS_DTYPE_F32:
             return launch_paged_slots_decode<float, 64>((float *)attn_val, (const float *)q,
@@ -744,6 +794,9 @@ void self_attention_paged_slots_decode(std::byte *attn_val, const std::byte *q,
         default: break;
         }
     }
+    const size_t smem_br32 =
+        32u * head_dim * sizeof(float) * 2 + 32u * sizeof(float) +
+        32u * sizeof(int64_t) + head_dim * sizeof(float) * 2;
     if (smem_br32 <= 48u * 1024u) {
         switch (type) {
         case LLAISYS_DTYPE_F32:
