@@ -7,6 +7,7 @@
 #include <cmath>
 #include <algorithm>
 #include <cstdlib>
+#include <chrono>
 
 #ifdef ENABLE_NVIDIA_API
 #include <cuda_runtime.h>
@@ -14,6 +15,32 @@
 
 namespace llaisys {
 namespace models {
+
+static inline bool env_flag_enabled(const char* name) {
+    const char* v = std::getenv(name);
+    return v && std::atoi(v) != 0;
+}
+
+static inline double ms_since(std::chrono::steady_clock::time_point start) {
+    auto end = std::chrono::steady_clock::now();
+    return std::chrono::duration<double, std::milli>(end - start).count();
+}
+
+static constexpr size_t kDecodeArgmaxParts = 256;
+
+static inline bool is_decode_graph_bucket(size_t batch_size) {
+    return batch_size == 8 || batch_size == 16 || batch_size == 32 || batch_size == 64;
+}
+
+static inline void sync_device_for_timing(llaisysDeviceType_t device_type) {
+#ifdef ENABLE_NVIDIA_API
+    if (device_type == LLAISYS_DEVICE_NVIDIA) {
+        cudaDeviceSynchronize();
+    }
+#else
+    (void)device_type;
+#endif
+}
 
 static inline void copy_contiguous_tensor_(const tensor_t &dst, const tensor_t &src) {
     CHECK_ARGUMENT(dst && src, "copy_contiguous_tensor_: null tensor");
@@ -243,6 +270,10 @@ void Qwen2TPModel::init_continuous(size_t max_slots) {
         decode_meta_[rank].pos_ids = Tensor::create({max_slots_}, LLAISYS_DTYPE_I64, device_type_, dev_id);
         decode_meta_[rank].max_idx = Tensor::create({max_slots_}, LLAISYS_DTYPE_I64, device_type_, dev_id);
         decode_meta_[rank].max_val = Tensor::create({max_slots_}, config_.dtype, device_type_, dev_id);
+        decode_meta_[rank].partial_max_idx = Tensor::create(
+            {max_slots_, kDecodeArgmaxParts}, LLAISYS_DTYPE_I64, device_type_, dev_id);
+        decode_meta_[rank].partial_max_val = Tensor::create(
+            {max_slots_, kDecodeArgmaxParts}, config_.dtype, device_type_, dev_id);
         decode_meta_[rank].input_ids = Tensor::create({max_slots_}, LLAISYS_DTYPE_I64, device_type_, dev_id);
         decode_meta_[rank].hidden_a = Tensor::create({max_slots_, config_.hs}, config_.dtype, device_type_, dev_id);
         decode_meta_[rank].hidden_b = Tensor::create({max_slots_, config_.hs}, config_.dtype, device_type_, dev_id);
@@ -296,6 +327,41 @@ int64_t Qwen2TPModel::prefill_slot(size_t slot_id, const std::vector<int64_t>& t
 
     slot_active_[slot_id] = 1;
     slot_seq_lens_[slot_id] = token_ids.size();
+    slot_last_tokens_[slot_id] = next_token;
+    return next_token;
+}
+
+int64_t Qwen2TPModel::prefill_slot_chunk(size_t slot_id, const std::vector<int64_t>& token_ids,
+                                         bool final_chunk) {
+    CHECK_ARGUMENT(continuous_ready_, "prefill_slot_chunk: init_continuous must be called first");
+    CHECK_ARGUMENT(slot_id < max_slots_, "prefill_slot_chunk: invalid slot_id");
+    CHECK_ARGUMENT(!token_ids.empty(), "prefill_slot_chunk: token_ids must not be empty");
+    CHECK_ARGUMENT(slot_seq_lens_[slot_id] + token_ids.size() <= config_.maxseq,
+                   "prefill_slot_chunk: sequence length exceeds maxseq");
+
+    size_t start_pos = slot_seq_lens_[slot_id];
+    std::vector<size_t> slot_ids{slot_id};
+    tensor_t logits = forward_slots(token_ids, slot_ids, start_pos, token_ids.size());
+
+    slot_active_[slot_id] = 1;
+    slot_seq_lens_[slot_id] += token_ids.size();
+
+    if (!final_chunk) {
+        return -2;
+    }
+
+    int dev_id = device_ids_[0];
+    core::context().setDevice(device_type_, dev_id);
+    tensor_t last_logits = logits->slice(0, token_ids.size() - 1, token_ids.size());
+    tensor_t max_idx = Tensor::create({1}, LLAISYS_DTYPE_I64, device_type_, dev_id);
+    tensor_t max_val = Tensor::create({1}, config_.dtype, device_type_, dev_id);
+    ops::argmax(max_idx, max_val, last_logits->view({config_.voc}));
+
+    int64_t next_token = -1;
+    std::vector<std::byte> buffer(sizeof(int64_t));
+    core::context().runtime().api()->memcpy_sync(
+        buffer.data(), max_idx->data(), sizeof(int64_t), LLAISYS_MEMCPY_D2H);
+    std::memcpy(&next_token, buffer.data(), sizeof(int64_t));
     slot_last_tokens_[slot_id] = next_token;
     return next_token;
 }
@@ -362,7 +428,15 @@ std::vector<int64_t> Qwen2TPModel::decode_slots(const std::vector<size_t>& slot_
     core::context().setDevice(device_type_, dev_id);
     tensor_t max_idx = decode_meta_[0].max_idx->slice(0, 0, slot_ids.size());
     tensor_t max_val = decode_meta_[0].max_val->slice(0, 0, slot_ids.size());
-    ops::argmax_batch(max_idx, max_val, logits);
+    const char* fast_argmax_env = std::getenv("LLAISYS_FAST_ARGMAX");
+    const bool use_fast_argmax = fast_argmax_env && std::atoi(fast_argmax_env) != 0;
+    if (use_fast_argmax && device_type_ == LLAISYS_DEVICE_NVIDIA) {
+        tensor_t partial_idx = decode_meta_[0].partial_max_idx->slice(0, 0, slot_ids.size());
+        tensor_t partial_val = decode_meta_[0].partial_max_val->slice(0, 0, slot_ids.size());
+        ops::argmax_batch_fast(max_idx, max_val, logits, partial_idx, partial_val);
+    } else {
+        ops::argmax_batch(max_idx, max_val, logits);
+    }
 
     std::vector<int64_t> next_tokens(slot_ids.size());
     core::context().runtime().api()->memcpy_sync(
@@ -428,11 +502,16 @@ void Qwen2TPModel::allreduce_sum(std::vector<tensor_t>& tensors) {
 
 #ifdef ENABLE_NVIDIA_API
     if (device_type_ == LLAISYS_DEVICE_NVIDIA && nccl_comm_) {
+        auto t0 = std::chrono::steady_clock::now();
         std::vector<void*> bufs(tp_size_);
         for (int i = 0; i < tp_size_; i++) {
             bufs[i] = tensors[i]->data();
         }
         nccl_comm_->allreduceSum(bufs, tensors[0]->numel(), tensors[0]->dtype());
+        if (env_flag_enabled("LLAISYS_TP_TIMING")) {
+            std::cerr << "[TP timing] allreduce numel=" << tensors[0]->numel()
+                      << " ms=" << ms_since(t0) << std::endl;
+        }
     }
 #endif
 }
@@ -512,6 +591,9 @@ tensor_t Qwen2TPModel::forward_slots(const std::vector<int64_t>& new_tokens, con
                                      size_t start_pos, size_t seq_len) {
     size_t batch_size = slot_ids.size();
     CHECK_ARGUMENT(new_tokens.size() == batch_size * seq_len, "forward_slots: token count mismatch");
+    const bool timing = env_flag_enabled("LLAISYS_PREFILL_TIMING");
+    auto total_t0 = std::chrono::steady_clock::now();
+    auto phase_t0 = total_t0;
     std::vector<tensor_t> hidden_states(tp_size_);
 
     for (int rank = 0; rank < tp_size_; rank++) {
@@ -524,9 +606,21 @@ tensor_t Qwen2TPModel::forward_slots(const std::vector<int64_t>& new_tokens, con
         hidden_states[rank] = Tensor::create({batch_size * seq_len, config_.hs}, config_.dtype, device_type_, dev_id);
         ops::embedding(hidden_states[rank], input_ids, ranks_[rank].weights.in_embed);
     }
+    if (timing) {
+        sync_device_for_timing(device_type_);
+        std::cerr << "[prefill timing] batch=" << batch_size << " seq_len=" << seq_len
+                  << " start_pos=" << start_pos
+                  << " embedding_ms=" << ms_since(phase_t0);
+        phase_t0 = std::chrono::steady_clock::now();
+    }
 
     for (size_t layer = 0; layer < config_.nlayer; layer++) {
         apply_layer_slots(layer, hidden_states, slot_ids, start_pos, seq_len);
+    }
+    if (timing) {
+        sync_device_for_timing(device_type_);
+        std::cerr << " layers_ms=" << ms_since(phase_t0);
+        phase_t0 = std::chrono::steady_clock::now();
     }
 
     int dev_id = device_ids_[0];
@@ -537,6 +631,11 @@ tensor_t Qwen2TPModel::forward_slots(const std::vector<int64_t>& new_tokens, con
 
     tensor_t logits = Tensor::create({batch_size * seq_len, config_.voc}, config_.dtype, device_type_, dev_id);
     ops::linear(logits, normed, ranks_[0].weights.out_embed, nullptr);
+    if (timing) {
+        sync_device_for_timing(device_type_);
+        std::cerr << " lm_head_ms=" << ms_since(phase_t0)
+                  << " total_ms=" << ms_since(total_t0) << std::endl;
+    }
 
     return logits;
 }
@@ -579,7 +678,16 @@ tensor_t Qwen2TPModel::forward_slots_decode(const std::vector<int64_t>& new_toke
     const bool can_use_graph = graph_enabled &&
                                device_type_ == LLAISYS_DEVICE_NVIDIA &&
                                tp_size_ == 1 &&
-                               batch_size == max_slots_;
+                               is_decode_graph_bucket(batch_size) &&
+                               !env_flag_enabled("LLAISYS_DECODE_TIMING");
+    if (can_use_graph && decode_graph_ready_ && decode_graph_batch_ != batch_size) {
+        cudaGraphExecDestroy(reinterpret_cast<cudaGraphExec_t>(decode_graph_exec_));
+        cudaGraphDestroy(reinterpret_cast<cudaGraph_t>(decode_graph_));
+        decode_graph_exec_ = nullptr;
+        decode_graph_ = nullptr;
+        decode_graph_ready_ = false;
+        decode_graph_batch_ = 0;
+    }
     if (can_use_graph && decode_graph_ready_ && decode_graph_batch_ == batch_size) {
         cudaError_t err = cudaGraphLaunch(reinterpret_cast<cudaGraphExec_t>(decode_graph_exec_), 0);
         if (err == cudaSuccess) {
@@ -591,13 +699,6 @@ tensor_t Qwen2TPModel::forward_slots_decode(const std::vector<int64_t>& new_toke
     }
 
     if (can_use_graph && !decode_graph_ready_) {
-        static bool graph_warned = false;
-        if (!graph_warned) {
-            std::cerr << "[TP] decode CUDA graph capture is disabled in this build; "
-                      << "falling back to normal decode" << std::endl;
-            graph_warned = true;
-        }
-#if 0
         cudaGraph_t graph = nullptr;
         cudaGraphExec_t graph_exec = nullptr;
         tensor_t logits;
@@ -638,8 +739,11 @@ tensor_t Qwen2TPModel::forward_slots_decode(const std::vector<int64_t>& new_toke
         if (graph) cudaGraphDestroy(graph);
         decode_graph_ready_ = false;
         decode_graph_batch_ = 0;
-        std::cerr << "[TP] decode CUDA graph capture unavailable; falling back to normal decode" << std::endl;
-#endif
+        static bool graph_warned = false;
+        if (!graph_warned) {
+            std::cerr << "[TP] decode CUDA graph capture unavailable; falling back to normal decode" << std::endl;
+            graph_warned = true;
+        }
     }
 #endif
 
@@ -649,6 +753,9 @@ tensor_t Qwen2TPModel::forward_slots_decode(const std::vector<int64_t>& new_toke
 tensor_t Qwen2TPModel::forward_slots_decode_compute(size_t batch_size,
                                                     const std::vector<size_t>& slot_ids,
                                                     const std::vector<size_t>& start_positions) {
+    const bool timing = env_flag_enabled("LLAISYS_DECODE_TIMING");
+    auto total_t0 = std::chrono::steady_clock::now();
+    auto phase_t0 = total_t0;
     std::vector<tensor_t> hidden_states(tp_size_);
     for (int rank = 0; rank < tp_size_; rank++) {
         int dev_id = device_ids_[rank];
@@ -658,9 +765,20 @@ tensor_t Qwen2TPModel::forward_slots_decode_compute(size_t batch_size,
         hidden_states[rank] = meta.hidden_a->slice(0, 0, batch_size);
         ops::embedding(hidden_states[rank], input_ids, ranks_[rank].weights.in_embed);
     }
+    if (timing) {
+        sync_device_for_timing(device_type_);
+        std::cerr << "[decode timing] batch=" << batch_size
+                  << " embedding_ms=" << ms_since(phase_t0);
+        phase_t0 = std::chrono::steady_clock::now();
+    }
 
     for (size_t layer = 0; layer < config_.nlayer; layer++) {
         apply_layer_slots_decode(layer, hidden_states, slot_ids, start_positions);
+    }
+    if (timing) {
+        sync_device_for_timing(device_type_);
+        std::cerr << " layers_ms=" << ms_since(phase_t0);
+        phase_t0 = std::chrono::steady_clock::now();
     }
 
     int dev_id = device_ids_[0];
@@ -671,6 +789,11 @@ tensor_t Qwen2TPModel::forward_slots_decode_compute(size_t batch_size,
 
     tensor_t logits = decode_meta_[0].logits->slice(0, 0, batch_size);
     ops::linear(logits, normed, ranks_[0].weights.out_embed, nullptr);
+    if (timing) {
+        sync_device_for_timing(device_type_);
+        std::cerr << " lm_head_ms=" << ms_since(phase_t0)
+                  << " total_ms=" << ms_since(total_t0) << std::endl;
+    }
 
     return logits;
 }
@@ -712,9 +835,20 @@ void Qwen2TPModel::apply_layer_slots(size_t layer_idx, std::vector<tensor_t>& hi
         tensor_t v_flat = Tensor::create(
             {flat_seq_len, nkvh_per_rank_ * config_.dh}, config_.dtype, device_type_, dev_id);
 
-        ops::linear(q_flat, attn_norm_out, w.attn_q_w[layer_idx], w.attn_q_b[layer_idx]);
-        ops::linear(k_flat, attn_norm_out, w.attn_k_w[layer_idx], w.attn_k_b[layer_idx]);
-        ops::linear(v_flat, attn_norm_out, w.attn_v_w[layer_idx], w.attn_v_b[layer_idx]);
+        const char* fused_qkv_env = std::getenv("LLAISYS_FUSED_QKV");
+        const bool use_fused_qkv = fused_qkv_env && std::atoi(fused_qkv_env) != 0 &&
+                                   w.attn_qkv_w[layer_idx] && w.attn_qkv_b[layer_idx];
+        if (use_fused_qkv) {
+            tensor_t qkv_flat = Tensor::create(
+                {flat_seq_len, (nh_per_rank_ + 2 * nkvh_per_rank_) * config_.dh},
+                config_.dtype, device_type_, dev_id);
+            ops::linear(qkv_flat, attn_norm_out, w.attn_qkv_w[layer_idx], w.attn_qkv_b[layer_idx]);
+            ops::split_qkv_decode(q_flat, k_flat, v_flat, qkv_flat);
+        } else {
+            ops::linear(q_flat, attn_norm_out, w.attn_q_w[layer_idx], w.attn_q_b[layer_idx]);
+            ops::linear(k_flat, attn_norm_out, w.attn_k_w[layer_idx], w.attn_k_b[layer_idx]);
+            ops::linear(v_flat, attn_norm_out, w.attn_v_w[layer_idx], w.attn_v_b[layer_idx]);
+        }
 
         tensor_t q = q_flat->view({flat_seq_len, nh_per_rank_, config_.dh});
         tensor_t k = k_flat->view({flat_seq_len, nkvh_per_rank_, config_.dh});
@@ -779,8 +913,18 @@ void Qwen2TPModel::apply_layer_slots(size_t layer_idx, std::vector<tensor_t>& hi
             {flat_seq_len, di_per_rank_}, config_.dtype, device_type_, dev_id);
         tensor_t up_out = Tensor::create(
             {flat_seq_len, di_per_rank_}, config_.dtype, device_type_, dev_id);
-        ops::linear(gate_out, mlp_norm_out, w.mlp_gate_w[layer_idx], nullptr);
-        ops::linear(up_out, mlp_norm_out, w.mlp_up_w[layer_idx], nullptr);
+        const char* fused_gate_env = std::getenv("LLAISYS_FUSED_GATE_UP");
+        const bool use_fused_gate_up = fused_gate_env && std::atoi(fused_gate_env) != 0 &&
+                                       w.mlp_gate_up_w[layer_idx];
+        if (use_fused_gate_up) {
+            tensor_t gate_up_out = Tensor::create(
+                {flat_seq_len, 2 * di_per_rank_}, config_.dtype, device_type_, dev_id);
+            ops::linear(gate_up_out, mlp_norm_out, w.mlp_gate_up_w[layer_idx], nullptr);
+            ops::split_gate_up_decode(gate_out, up_out, gate_up_out);
+        } else {
+            ops::linear(gate_out, mlp_norm_out, w.mlp_gate_w[layer_idx], nullptr);
+            ops::linear(up_out, mlp_norm_out, w.mlp_up_w[layer_idx], nullptr);
+        }
 
         // SwiGLU
         tensor_t swiglu_out = Tensor::create(
@@ -872,8 +1016,13 @@ void Qwen2TPModel::apply_layer_slots_decode(size_t layer_idx, std::vector<tensor
         }
 
         tensor_t attn_out = meta.attn_out->slice(0, 0, batch_size);
-        ops::self_attention_slots_decode(attn_out, q, kv_cache.k_cache, kv_cache.v_cache,
-                                         slot_ids_t, seq_lens_t, scale);
+        if (env_flag_enabled("LLAISYS_GQA_ATTN")) {
+            ops::self_attention_gqa_slots_decode(attn_out, q, kv_cache.k_cache, kv_cache.v_cache,
+                                                 slot_ids_t, seq_lens_t, scale);
+        } else {
+            ops::self_attention_slots_decode(attn_out, q, kv_cache.k_cache, kv_cache.v_cache,
+                                             slot_ids_t, seq_lens_t, scale);
+        }
 
         tensor_t attn_out_flat = attn_out->view({batch_size, nh_per_rank_ * config_.dh});
         o_proj[rank] = meta.o_proj->slice(0, 0, batch_size);

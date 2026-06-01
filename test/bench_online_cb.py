@@ -5,10 +5,13 @@ import random
 import subprocess
 import threading
 import time
+from collections import Counter
 from pathlib import Path
 
 import llaisys
 from llaisys.models import Qwen2TP, Qwen2TPContinuousEngine
+
+DEFAULT_RESULT_DIR = Path("/home/dzy/za/tmp")
 
 
 def parse_int_list(value):
@@ -16,7 +19,27 @@ def parse_int_list(value):
 
 
 def parse_float_list(value):
-    return [float(x) for x in value.split(",") if x.strip()]
+    values = []
+    for x in value.split(","):
+        x = x.strip()
+        if not x:
+            continue
+        values.append(float("inf") if x.lower() == "inf" else float(x))
+    return values
+
+
+def format_rate(value):
+    return "inf" if value == float("inf") else f"{value:.2f}"
+
+
+def sample_len(rng, choices, range_value):
+    if range_value:
+        vals = parse_int_list(range_value)
+        if len(vals) != 2:
+            raise ValueError("length range must be formatted as low,high")
+        lo, hi = vals
+        return rng.randint(lo, hi)
+    return rng.choice(choices)
 
 
 def query_gpu_mem_mib_all():
@@ -80,14 +103,15 @@ def make_prompt_tokens(length, vocab_size, eos_token_id, rng):
     return tokens
 
 
-def build_requests(arrival_rate, duration_s, prompt_lens, output_lens, vocab_size, eos_token_id, rng):
+def build_requests(arrival_rate, duration_s, num_requests, prompt_lens, output_lens,
+                   prompt_len_range, output_len_range, vocab_size, eos_token_id, rng):
     requests = []
     t = 0.0
     req_id = 0
-    interval = 1.0 / arrival_rate
-    while t < duration_s:
-        prompt_len = rng.choice(prompt_lens)
-        output_len = rng.choice(output_lens)
+    interval = 0.0 if arrival_rate == float("inf") else 1.0 / arrival_rate
+    while (num_requests > 0 and req_id < num_requests) or (num_requests <= 0 and t < duration_s):
+        prompt_len = sample_len(rng, prompt_lens, prompt_len_range)
+        output_len = sample_len(rng, output_lens, output_len_range)
         requests.append(
             {
                 "request_id": req_id,
@@ -123,9 +147,9 @@ def load_workload(path):
 def assign_arrivals(records, arrival_rate, duration_s, rng, pattern):
     requests = []
     t = 0.0
-    interval = 1.0 / arrival_rate
+    interval = 0.0 if arrival_rate == float("inf") else 1.0 / arrival_rate
     for i, rec in enumerate(records):
-        if t >= duration_s:
+        if arrival_rate != float("inf") and t >= duration_s:
             break
         req = {
             "request_id": int(rec.get("request_id", i)),
@@ -135,15 +159,34 @@ def assign_arrivals(records, arrival_rate, duration_s, rng, pattern):
             "output_len": rec["output_len"],
         }
         requests.append(req)
-        if pattern == "poisson":
+        if arrival_rate == float("inf"):
+            t = 0.0
+        elif pattern == "poisson":
             t += rng.expovariate(arrival_rate)
         else:
             t += interval
     return requests
 
 
+def choose_prefill_len(waiting, prefill_bucket_size):
+    if not waiting or prefill_bucket_size <= 0:
+        return waiting[0]["prompt_len"]
+    first_len = waiting[0]["prompt_len"]
+    bucket_start = (first_len // prefill_bucket_size) * prefill_bucket_size
+    bucket_end = bucket_start + prefill_bucket_size
+    counts = Counter(
+        req["prompt_len"]
+        for req in waiting
+        if bucket_start <= req["prompt_len"] < bucket_end
+    )
+    if not counts:
+        return first_len
+    return max(counts.items(), key=lambda item: (item[1], -abs(item[0] - first_len)))[0]
+
+
 def run_one(model, args, arrival_rate, device_ids):
-    rng = random.Random(args.seed + int(arrival_rate * 1000))
+    rate_seed = 1000000 if arrival_rate == float("inf") else int(arrival_rate * 1000)
+    rng = random.Random(args.seed + rate_seed)
     eos_token_id = model._config.get("eos_token_id")
     vocab_size = model._config["vocab_size"]
     if args.workload:
@@ -156,8 +199,11 @@ def run_one(model, args, arrival_rate, device_ids):
         requests = build_requests(
             arrival_rate,
             args.duration,
+            args.num_requests,
             parse_int_list(args.prompt_lens),
             parse_int_list(args.output_lens),
+            args.prompt_len_range,
+            args.output_len_range,
             vocab_size,
             eos_token_id,
             rng,
@@ -173,12 +219,14 @@ def run_one(model, args, arrival_rate, device_ids):
     waiting = []
     completed = []
     active_samples = []
+    waiting_samples = []
     req_idx = 0
+    last_progress_s = 0.0
 
     start = time.perf_counter()
     sampler.start()
     try:
-        while req_idx < len(requests) or waiting or engine.active_count() > 0:
+        while req_idx < len(requests) or waiting or engine.prefilling_count() > 0 or engine.active_count() > 0:
             now = time.perf_counter()
             elapsed = now - start
 
@@ -188,22 +236,50 @@ def run_one(model, args, arrival_rate, device_ids):
                 waiting.append(req)
                 req_idx += 1
 
+            prefill_budget = args.chunked_prefill_tokens
+            if prefill_budget > 0 and engine.prefilling_count() > 0:
+                done, used_tokens = engine.prefill_step(prefill_budget)
+                completed.extend(done)
+                prefill_budget -= used_tokens
+
             while waiting and engine.can_accept():
+                if args.chunked_prefill_tokens > 0:
+                    if prefill_budget <= 0:
+                        break
+                    req = waiting.pop(0)
+                    done, used_tokens = engine.start_prefill_chunked(
+                        req, prefill_budget, req["arrival_abs_s"]
+                    )
+                    completed.extend(done)
+                    prefill_budget -= used_tokens
+                    continue
                 if args.prefill_wait_ms > 0 and req_idx < len(requests):
                     oldest_wait_s = time.perf_counter() - waiting[0]["arrival_abs_s"]
                     free_slots = len(engine.free_slots)
                     if oldest_wait_s * 1000.0 < args.prefill_wait_ms and len(waiting) < free_slots:
                         break
                 free_slots = len(engine.free_slots)
-                first_len = waiting[0]["prompt_len"]
+                first_len = choose_prefill_len(waiting, args.prefill_bucket_size)
                 batch = []
                 keep = []
+                used_prefill_tokens = 0
+                max_prefill_batch = args.max_prefill_batch if args.max_prefill_batch > 0 else free_slots
                 for req in waiting:
-                    if req["prompt_len"] == first_len and len(batch) < free_slots:
+                    same_len = req["prompt_len"] == first_len
+                    under_batch = len(batch) < min(free_slots, max_prefill_batch)
+                    under_budget = (
+                        prefill_budget <= 0
+                        or used_prefill_tokens + req["prompt_len"] <= prefill_budget
+                        or not batch
+                    )
+                    if same_len and under_batch and under_budget:
                         batch.append(req)
+                        used_prefill_tokens += req["prompt_len"]
                     else:
                         keep.append(req)
                 waiting = keep
+                if not batch:
+                    break
                 if len(batch) == 1:
                     req = batch[0]
                     done = engine.submit(
@@ -216,13 +292,29 @@ def run_one(model, args, arrival_rate, device_ids):
                         completed.append(done)
                 else:
                     completed.extend(engine.submit_many_same_len(batch, time.perf_counter()))
+                if prefill_budget > 0:
+                    prefill_budget -= used_prefill_tokens
+                    if prefill_budget <= 0:
+                        break
 
             if engine.active_count() > 0:
-                completed.extend(engine.step(time.perf_counter()))
+                completed.extend(engine.step(time.perf_counter(), max_batch=args.max_active_decode))
                 active_samples.append(engine.active_count())
+                waiting_samples.append(len(waiting))
             elif req_idx < len(requests):
                 sleep_s = max(0.0, start + requests[req_idx]["arrival_s"] - time.perf_counter())
                 time.sleep(min(sleep_s, 0.001))
+
+            if args.progress_interval > 0 and elapsed - last_progress_s >= args.progress_interval:
+                last_progress_s = elapsed
+                cur_output = sum(len(c["output_tokens"]) for c in completed)
+                cur_wall = max(1e-9, time.perf_counter() - start)
+                print(
+                    f"[progress] t={elapsed:.1f}s submitted={req_idx}/{len(requests)} "
+                    f"waiting={len(waiting)} prefilling={engine.prefilling_count()} active={engine.active_count()} "
+                    f"completed={len(completed)} output_tok_s={cur_output / cur_wall:.1f}",
+                    flush=True,
+                )
     finally:
         sampler.stop()
 
@@ -261,6 +353,11 @@ def run_one(model, args, arrival_rate, device_ids):
         if engine_metrics["prefill_calls"] > 0
         else 0.0
     )
+    decode_batch_avg = (
+        engine_metrics["decode_slot_steps"] / engine_metrics["decode_steps"]
+        if engine_metrics["decode_steps"] > 0
+        else 0.0
+    )
 
     return {
         "arrival_rate": arrival_rate,
@@ -277,34 +374,47 @@ def run_one(model, args, arrival_rate, device_ids):
         "peak_mem_mib": peak_mem,
         "avg_active": sum(active_samples) / len(active_samples) if active_samples else 0.0,
         "max_active": max(active_samples) if active_samples else 0,
+        "avg_waiting": sum(waiting_samples) / len(waiting_samples) if waiting_samples else 0.0,
+        "max_waiting": max(waiting_samples) if waiting_samples else 0,
         "wall_s": wall_s,
         "prompt_len_avg": sum(prompt_lens_completed) / len(prompt_lens_completed) if prompt_lens_completed else 0.0,
         "prompt_len_p90": percentile(prompt_lens_completed, 90),
         "output_len_avg": sum(output_lens_completed) / len(output_lens_completed) if output_lens_completed else 0.0,
         "prefill_calls": engine_metrics["prefill_calls"],
+        "prefill_chunks": engine_metrics.get("prefill_chunks", 0),
+        "chunked_prefill_reqs": engine_metrics.get("chunked_prefill_reqs", 0),
         "prefill_batch_avg": prefill_batch_avg,
         "prefill_s": prefill_s,
         "prefill_tok_s": prefill_tok_s,
         "decode_steps": engine_metrics["decode_steps"],
+        "decode_batch_avg": decode_batch_avg,
+        "decode_max_batch": engine_metrics["decode_max_batch"],
         "decode_s": decode_s,
         "decode_step_ms": decode_step_s * 1000.0,
         "decode_slot_step_ms": decode_slot_step_s * 1000.0,
+        "max_active_decode": args.max_active_decode,
+        "max_prefill_batch": args.max_prefill_batch,
+        "chunked_prefill_tokens": args.chunked_prefill_tokens,
+        "prefill_bucket_size": args.prefill_bucket_size,
     }
 
 
 def print_summary(row):
     print(
-        f"arrival={row['arrival_rate']:.2f} req/s | completed={row['completed']} | "
+        f"arrival={format_rate(row['arrival_rate'])} req/s | completed={row['completed']} | "
         f"qps={row['qps']:.2f} | output={row['output_tok_s']:.2f} tok/s | "
         f"TTFT avg/p90/p99={row['avg_ttft_ms']:.1f}/{row['p90_ttft_ms']:.1f}/{row['p99_ttft_ms']:.1f} ms | "
         f"TPOT={row['avg_tpot_ms']:.1f} ms | p99 latency={row['p99_latency_ms']:.1f} ms | "
-        f"active avg/max={row['avg_active']:.1f}/{row['max_active']} | mem={row['peak_mem_mib']} MiB"
+        f"active avg/max={row['avg_active']:.1f}/{row['max_active']} | "
+        f"waiting avg/max={row['avg_waiting']:.1f}/{row['max_waiting']} | mem={row['peak_mem_mib']} MiB"
     )
     print(
         f"  profile: wall={row['wall_s']:.2f}s | prompt avg/p90={row['prompt_len_avg']:.1f}/{row['prompt_len_p90']:.0f} | "
         f"prefill calls={row['prefill_calls']} avg_batch={row['prefill_batch_avg']:.2f} "
+        f"chunks={row['prefill_chunks']} chunked_reqs={row['chunked_prefill_reqs']} "
         f"time={row['prefill_s']:.2f}s tok/s={row['prefill_tok_s']:.1f} | "
-        f"decode steps={row['decode_steps']} time={row['decode_s']:.2f}s "
+        f"decode steps={row['decode_steps']} batch avg/max={row['decode_batch_avg']:.1f}/{row['decode_max_batch']} "
+        f"time={row['decode_s']:.2f}s "
         f"step={row['decode_step_ms']:.1f}ms slot-step={row['decode_slot_step_ms']:.1f}ms"
     )
 
@@ -318,9 +428,16 @@ def main():
     parser.add_argument("--duration", default=30.0, type=float)
     parser.add_argument("--prompt_lens", default="128", type=str)
     parser.add_argument("--output_lens", default="32", type=str)
+    parser.add_argument("--prompt_len_range", default="", type=str)
+    parser.add_argument("--output_len_range", default="", type=str)
     parser.add_argument("--workload", default="", type=str)
     parser.add_argument("--num_requests", default=0, type=int)
     parser.add_argument("--arrival_pattern", default="fixed", choices=["fixed", "poisson"])
+    parser.add_argument("--max_active_decode", default=0, type=int)
+    parser.add_argument("--prefill_bucket_size", default=0, type=int)
+    parser.add_argument("--max_prefill_batch", default=0, type=int)
+    parser.add_argument("--chunked_prefill_tokens", default=0, type=int)
+    parser.add_argument("--progress_interval", default=10.0, type=float)
     parser.add_argument(
         "--prefill_wait_ms",
         default=0.0,
@@ -328,11 +445,21 @@ def main():
         help="Optional scheduler coalescing delay before admitting waiting requests to improve batch prefill.",
     )
     parser.add_argument("--seed", default=1, type=int)
-    parser.add_argument("--csv", default="bench_online_cb.csv", type=str)
+    parser.add_argument("--csv", default="", type=str)
     eos_group = parser.add_mutually_exclusive_group()
     eos_group.add_argument("--ignore_eos", dest="ignore_eos", action="store_true", default=True)
     eos_group.add_argument("--respect_eos", dest="ignore_eos", action="store_false")
     args = parser.parse_args()
+    if not args.csv:
+        DEFAULT_RESULT_DIR.mkdir(parents=True, exist_ok=True)
+        args.csv = str(DEFAULT_RESULT_DIR / "bench_online_cb.csv")
+    else:
+        csv_path = Path(args.csv)
+        if not csv_path.is_absolute():
+            DEFAULT_RESULT_DIR.mkdir(parents=True, exist_ok=True)
+            args.csv = str(DEFAULT_RESULT_DIR / csv_path)
+        else:
+            csv_path.parent.mkdir(parents=True, exist_ok=True)
 
     device_ids = parse_int_list(args.device_ids)
     if len(device_ids) != 1:
@@ -341,7 +468,7 @@ def main():
     model = Qwen2TP(Path(args.model), llaisys.DeviceType.NVIDIA, device_ids=device_ids)
     rows = []
     for arrival_rate in parse_float_list(args.arrival_rates):
-        print(f"\n=== Online Continuous Batching: arrival_rate={arrival_rate} req/s ===")
+        print(f"\n=== Online Continuous Batching: arrival_rate={format_rate(arrival_rate)} req/s ===")
         row = run_one(model, args, arrival_rate, device_ids)
         rows.append(row)
         print_summary(row)
@@ -361,18 +488,28 @@ def main():
         "peak_mem_mib",
         "avg_active",
         "max_active",
+        "avg_waiting",
+        "max_waiting",
         "wall_s",
         "prompt_len_avg",
         "prompt_len_p90",
         "output_len_avg",
         "prefill_calls",
+        "prefill_chunks",
+        "chunked_prefill_reqs",
         "prefill_batch_avg",
         "prefill_s",
         "prefill_tok_s",
         "decode_steps",
+        "decode_batch_avg",
+        "decode_max_batch",
         "decode_s",
         "decode_step_ms",
         "decode_slot_step_ms",
+        "max_active_decode",
+        "max_prefill_batch",
+        "chunked_prefill_tokens",
+        "prefill_bucket_size",
     ]
     with open(args.csv, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fields)

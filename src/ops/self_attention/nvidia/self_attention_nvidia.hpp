@@ -11,4 +11,8 @@ void self_attention_slots_decode(std::byte *attn_val, const std::byte *q, const 
                                  const std::byte *v_cache, const int64_t *slot_ids, const int64_t *seq_lens,
                                  float scale, llaisysDataType_t type, size_t batch_size, size_t maxseq,
                                  size_t n_heads, size_t n_kv_heads, size_t head_dim);
+void self_attention_gqa_slots_decode(std::byte *attn_val, const std::byte *q, const std::byte *k_cache,
+                                     const std::byte *v_cache, const int64_t *slot_ids, const int64_t *seq_lens,
+                                     float scale, llaisysDataType_t type, size_t batch_size, size_t maxseq,
+                                     size_t n_heads, size_t n_kv_heads, size_t head_dim);
 }

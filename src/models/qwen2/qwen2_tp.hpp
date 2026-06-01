@@ -35,6 +35,7 @@ public:
 
     void init_continuous(size_t max_slots);
     int64_t prefill_slot(size_t slot_id, const std::vector<int64_t>& token_ids);
+    int64_t prefill_slot_chunk(size_t slot_id, const std::vector<int64_t>& token_ids, bool final_chunk);
     std::vector<int64_t> prefill_slots(const std::vector<size_t>& slot_ids,
                                        const std::vector<int64_t>& token_ids,
                                        size_t prompt_len);
@@ -69,6 +70,8 @@ private:
         tensor_t pos_ids;
         tensor_t max_idx;
         tensor_t max_val;
+        tensor_t partial_max_idx;
+        tensor_t partial_max_val;
         tensor_t input_ids;
         tensor_t hidden_a;
         tensor_t hidden_b;

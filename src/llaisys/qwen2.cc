@@ -282,6 +282,15 @@ int64_t llaisysQwen2TPModelPrefillSlot(struct LlaisysQwen2TPModel *model, size_t
     return model->model->prefill_slot(slot_id, tokens);
 }
 
+int llaisysQwen2TPModelPrefillSlotChunk(struct LlaisysQwen2TPModel *model, size_t slot_id,
+                                        int64_t *token_ids, size_t ntoken, int final_chunk,
+                                        int64_t *out) {
+    if (!model || !model->model || !token_ids || ntoken == 0 || !out) return -1;
+    std::vector<int64_t> tokens(token_ids, token_ids + ntoken);
+    *out = model->model->prefill_slot_chunk(slot_id, tokens, final_chunk != 0);
+    return 0;
+}
+
 int llaisysQwen2TPModelPrefillSlots(struct LlaisysQwen2TPModel *model, size_t *slot_ids,
                                     int64_t *token_ids, int64_t *out, size_t nslot,
                                     size_t prompt_len) {

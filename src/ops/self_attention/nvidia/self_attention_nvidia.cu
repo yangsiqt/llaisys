@@ -8,6 +8,7 @@
 #include <cuda_runtime.h>
 #include <cstdlib>
 #include <stdexcept>
+#include <type_traits>
 
 template <typename T>
 __device__ inline float load_f(const T *p, size_t i) {
@@ -288,6 +289,139 @@ static void launch_slots_decode(T *attn_val, const T *q, const T *k_cache, const
         head_dim);
 }
 
+template <typename T, int BR, int MAX_GROUP>
+__global__ void self_attn_gqa_slots_decode_kernel(T *attn_val, const T *q, const T *k_cache, const T *v_cache,
+                                                  const int64_t *slot_ids, const int64_t *seq_lens, float scale,
+                                                  size_t batch_size, size_t maxseq, size_t n_heads,
+                                                  size_t n_kv_heads, size_t head_dim) {
+    const size_t bi = blockIdx.x / n_kv_heads;
+    const size_t kv_h = blockIdx.x % n_kv_heads;
+    if (bi >= batch_size) return;
+
+    const int64_t slot_i64 = slot_ids[bi];
+    const int64_t seq_i64 = seq_lens[bi];
+    if (slot_i64 < 0 || seq_i64 < 0) return;
+
+    const size_t slot_id = static_cast<size_t>(slot_i64);
+    const size_t kv_len = static_cast<size_t>(seq_i64) + 1;
+    const size_t group = n_heads / n_kv_heads;
+    if (group > MAX_GROUP) return;
+    const unsigned tid = threadIdx.x;
+
+    extern __shared__ unsigned char smem_u[];
+    float *const K_tile = reinterpret_cast<float *>(smem_u);
+    float *const V_tile = K_tile + BR * head_dim;
+    float *const Q_tile = V_tile + BR * head_dim;
+    float *const O_acc = Q_tile + MAX_GROUP * head_dim;
+    float *const S_tile = O_acc + MAX_GROUP * head_dim;
+
+    for (int gh = 0; gh < (int)group; gh++) {
+        const size_t h = kv_h * group + (size_t)gh;
+        for (size_t d = tid; d < head_dim; d += blockDim.x) {
+            Q_tile[gh * (int)head_dim + d] =
+                load_f(q, bi * n_heads * head_dim + h * head_dim + d);
+            O_acc[gh * (int)head_dim + d] = 0.f;
+        }
+    }
+    __syncthreads();
+
+    float m[MAX_GROUP];
+    float l[MAX_GROUP];
+    for (int gh = 0; gh < MAX_GROUP; gh++) {
+        m[gh] = -FLT_MAX;
+        l[gh] = 0.f;
+    }
+
+    for (int k0 = 0; k0 < (int)kv_len; k0 += BR) {
+        const int tile_len = min(BR, (int)kv_len - k0);
+
+        for (int idx = tid; idx < tile_len * (int)head_dim; idx += blockDim.x) {
+            const int b = idx / (int)head_dim;
+            const int d = idx % (int)head_dim;
+            const size_t ki = (size_t)k0 + (size_t)b;
+            const size_t off = (((slot_id * maxseq + ki) * n_kv_heads + kv_h) * head_dim + (size_t)d);
+            K_tile[b * (int)head_dim + d] = load_f(k_cache, off);
+            V_tile[b * (int)head_dim + d] = load_f(v_cache, off);
+        }
+        __syncthreads();
+
+        for (int gh = 0; gh < (int)group; gh++) {
+            float *S = S_tile + gh * BR;
+            for (int b = tid; b < tile_len; b += blockDim.x) {
+                float sc = 0.f;
+                for (size_t d = 0; d < head_dim; d++) {
+                    sc += Q_tile[gh * (int)head_dim + (int)d] *
+                          K_tile[b * (int)head_dim + (int)d];
+                }
+                S[b] = sc * scale;
+            }
+            __syncthreads();
+
+            float local_max = -FLT_MAX;
+            for (int b = tid; b < tile_len; b += blockDim.x) local_max = fmaxf(local_max, S[b]);
+            const float m_tile = block_reduce_max(local_max);
+            const float m_new = fmaxf(m[gh], m_tile);
+            __syncthreads();
+
+            for (int b = tid; b < tile_len; b += blockDim.x) {
+                const float pb = expf(S[b] - m_new);
+                S[b] = pb;
+            }
+            __syncthreads();
+
+            float local_sum = 0.f;
+            for (int b = tid; b < tile_len; b += blockDim.x) local_sum += S[b];
+            const float sum_p = block_reduce_sum(local_sum);
+
+            const float alpha = expf(m[gh] - m_new);
+            const float l_new = alpha * l[gh] + sum_p;
+
+            for (size_t d = tid; d < head_dim; d += blockDim.x) {
+                float pv = 0.f;
+                for (int b = 0; b < tile_len; b++)
+                    pv += S[b] * V_tile[b * (int)head_dim + (int)d];
+                O_acc[gh * (int)head_dim + (int)d] =
+                    O_acc[gh * (int)head_dim + (int)d] * alpha + pv;
+            }
+            __syncthreads();
+
+            m[gh] = m_new;
+            l[gh] = l_new;
+        }
+    }
+
+    for (int gh = 0; gh < (int)group; gh++) {
+        const float inv_l = (l[gh] > 0.f) ? (1.f / l[gh]) : 0.f;
+        const size_t h = kv_h * group + (size_t)gh;
+        for (size_t d = tid; d < head_dim; d += blockDim.x) {
+            const float out = O_acc[gh * (int)head_dim + (int)d] * inv_l;
+            store_f(attn_val, bi * n_heads * head_dim + h * head_dim + d, out);
+        }
+    }
+}
+
+template <typename T, int BR>
+static void launch_gqa_slots_decode(T *attn_val, const T *q, const T *k_cache, const T *v_cache,
+                                    const int64_t *slot_ids, const int64_t *seq_lens, float scale,
+                                    size_t batch_size, size_t maxseq, size_t n_heads, size_t n_kv_heads,
+                                    size_t head_dim) {
+    constexpr int MAX_GROUP = 8;
+    const int blocks = (int)(batch_size * n_kv_heads);
+    const int threads = 256;
+    const size_t smem_bytes =
+        (size_t)BR * head_dim * sizeof(float) * 2 +
+        (size_t)MAX_GROUP * head_dim * sizeof(float) * 2 +
+        (size_t)MAX_GROUP * BR * sizeof(float);
+    if (smem_bytes > 48u * 1024u) {
+        cudaFuncSetAttribute(self_attn_gqa_slots_decode_kernel<T, BR, MAX_GROUP>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             (int)smem_bytes);
+    }
+    self_attn_gqa_slots_decode_kernel<T, BR, MAX_GROUP><<<blocks, threads, smem_bytes>>>(
+        attn_val, q, k_cache, v_cache, slot_ids, seq_lens, scale, batch_size, maxseq, n_heads, n_kv_heads,
+        head_dim);
+}
+
 namespace llaisys::ops::nvidia {
 
 // qlen_per_seq: number of query tokens per sequence (1 for decode, seq_len for prefill).
@@ -428,6 +562,36 @@ void self_attention_slots_decode(std::byte *attn_val, const std::byte *q, const 
     };
 
     pick_and_launch();
+}
+
+void self_attention_gqa_slots_decode(std::byte *attn_val, const std::byte *q, const std::byte *k_cache,
+                                     const std::byte *v_cache, const int64_t *slot_ids, const int64_t *seq_lens,
+                                     float scale, llaisysDataType_t type, size_t batch_size, size_t maxseq,
+                                     size_t n_heads, size_t n_kv_heads, size_t head_dim) {
+    const size_t group = n_heads / n_kv_heads;
+    if (head_dim != 128 || group == 0 || group > 8) {
+        return self_attention_slots_decode(attn_val, q, k_cache, v_cache, slot_ids, seq_lens, scale, type,
+                                           batch_size, maxseq, n_heads, n_kv_heads, head_dim);
+    }
+
+    switch (type) {
+    case LLAISYS_DTYPE_F32:
+        return launch_gqa_slots_decode<float, 32>((float *)attn_val, (const float *)q, (const float *)k_cache,
+                                                 (const float *)v_cache, slot_ids, seq_lens, scale, batch_size,
+                                                 maxseq, n_heads, n_kv_heads, head_dim);
+    case LLAISYS_DTYPE_BF16:
+        return launch_gqa_slots_decode<__nv_bfloat16, 32>(
+            (__nv_bfloat16 *)attn_val, (const __nv_bfloat16 *)q, (const __nv_bfloat16 *)k_cache,
+            (const __nv_bfloat16 *)v_cache, slot_ids, seq_lens, scale, batch_size, maxseq, n_heads, n_kv_heads,
+            head_dim);
+    case LLAISYS_DTYPE_F16:
+        return launch_gqa_slots_decode<__half, 32>((__half *)attn_val, (const __half *)q,
+                                                  (const __half *)k_cache, (const __half *)v_cache, slot_ids,
+                                                  seq_lens, scale, batch_size, maxseq, n_heads, n_kv_heads,
+                                                  head_dim);
+    default:
+        throw std::runtime_error("Unsupported dtype for self_attention_gqa_slots_decode");
+    }
 }
 
 } // namespace llaisys::ops::nvidia

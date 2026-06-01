@@ -781,6 +781,18 @@ class Qwen2TP:
             raise RuntimeError("llaisysQwen2TPModelPrefillSlot failed")
         return int(next_token)
 
+    def prefill_slot_chunk(self, slot_id: int, token_ids: Sequence[int], final_chunk: bool) -> int | None:
+        if not token_ids:
+            raise ValueError("token_ids must not be empty")
+        token_array = (c_int64 * len(token_ids))(*token_ids)
+        out = c_int64()
+        rc = LIB_LLAISYS.llaisysQwen2TPModelPrefillSlotChunk(
+            self._model, slot_id, token_array, len(token_ids), int(final_chunk), out
+        )
+        if rc != 0:
+            raise RuntimeError("llaisysQwen2TPModelPrefillSlotChunk failed")
+        return None if int(out.value) == -2 else int(out.value)
+
     def prefill_slots(self, slot_ids: Sequence[int], inputs_batch):
         if not slot_ids:
             return []
@@ -842,14 +854,18 @@ class Qwen2TPContinuousEngine:
         self.ignore_eos = ignore_eos
         self.free_slots = list(range(self.max_slots))
         self.active = {}
+        self.prefilling = []
         self.stats = {
             "prefill_calls": 0,
             "prefill_batches": 0,
+            "prefill_chunks": 0,
+            "chunked_prefill_reqs": 0,
             "prefill_s": 0.0,
             "prefill_tokens": 0,
             "decode_steps": 0,
             "decode_s": 0.0,
             "decode_slot_steps": 0,
+            "decode_max_batch": 0,
         }
         self.model.init_continuous(self.max_slots)
 
@@ -925,12 +941,56 @@ class Qwen2TPContinuousEngine:
                 completed.append(self._finish_slot(slot_id, first_token_s))
         return [c for c in completed if c is not None]
 
-    def step(self, now_s: float):
+    def start_prefill_chunked(self, request, chunk_tokens: int, now_s: float):
+        if not self.free_slots:
+            return [], 0
+        slot_id = self.free_slots.pop(0)
+        state = {
+            "request_id": request["request_id"],
+            "slot_id": slot_id,
+            "prompt_tokens": request["prompt_tokens"],
+            "prompt_len": len(request["prompt_tokens"]),
+            "target_output_len": int(request["output_len"]),
+            "arrival_s": now_s if "arrival_abs_s" not in request else request["arrival_abs_s"],
+            "first_token_s": None,
+            "finish_s": None,
+            "output_tokens": [],
+            "last_token": None,
+            "prefill_offset": 0,
+        }
+        self.stats["chunked_prefill_reqs"] += 1
+        completed, used_tokens = self._run_prefill_chunk(state, chunk_tokens)
+        if state["prefill_offset"] < state["prompt_len"]:
+            self.prefilling.append(state)
+        return completed, used_tokens
+
+    def prefill_step(self, max_tokens: int):
+        if not self.prefilling or max_tokens <= 0:
+            return [], 0
+        completed = []
+        used_tokens = 0
+        keep = []
+        for state in self.prefilling:
+            if used_tokens >= max_tokens:
+                keep.append(state)
+                continue
+            budget = max_tokens - used_tokens
+            done, used = self._run_prefill_chunk(state, budget)
+            used_tokens += used
+            completed.extend(done)
+            if state["prefill_offset"] < state["prompt_len"]:
+                keep.append(state)
+        self.prefilling = keep
+        return completed, used_tokens
+
+    def step(self, now_s: float, max_batch: int = 0):
         if not self.active:
             return []
 
         completed = []
         slot_ids = sorted(self.active)
+        if max_batch and max_batch > 0:
+            slot_ids = slot_ids[:max_batch]
         input_tokens = [self.active[s]["last_token"] for s in slot_ids]
         import time
         t0 = time.perf_counter()
@@ -938,6 +998,7 @@ class Qwen2TPContinuousEngine:
         self.stats["decode_s"] += time.perf_counter() - t0
         self.stats["decode_steps"] += 1
         self.stats["decode_slot_steps"] += len(slot_ids)
+        self.stats["decode_max_batch"] = max(self.stats["decode_max_batch"], len(slot_ids))
         for slot_id, next_token in zip(slot_ids, next_tokens):
             if slot_id not in self.active:
                 continue
@@ -951,8 +1012,46 @@ class Qwen2TPContinuousEngine:
     def active_count(self) -> int:
         return len(self.active)
 
+    def prefilling_count(self) -> int:
+        return len(self.prefilling)
+
     def metrics(self):
         return dict(self.stats)
+
+    def _run_prefill_chunk(self, state, max_tokens: int):
+        import time
+        remaining = state["prompt_len"] - state["prefill_offset"]
+        if remaining <= 0:
+            return [], 0
+        chunk_len = min(max_tokens, remaining)
+        begin = state["prefill_offset"]
+        end = begin + chunk_len
+        final_chunk = end == state["prompt_len"]
+        t0 = time.perf_counter()
+        first_token = self.model.prefill_slot_chunk(
+            state["slot_id"],
+            state["prompt_tokens"][begin:end],
+            final_chunk,
+        )
+        prefill_dt = time.perf_counter() - t0
+        state["prefill_offset"] = end
+        self.stats["prefill_calls"] += 1
+        self.stats["prefill_batches"] += 1
+        self.stats["prefill_chunks"] += 1
+        self.stats["prefill_s"] += prefill_dt
+        self.stats["prefill_tokens"] += chunk_len
+        if not final_chunk:
+            return [], chunk_len
+
+        first_token_s = time.perf_counter()
+        state["first_token_s"] = first_token_s
+        state["last_token"] = first_token
+        state["output_tokens"].append(first_token)
+        self.active[state["slot_id"]] = state
+        completed = []
+        if self._is_finished(state, first_token):
+            completed.append(self._finish_slot(state["slot_id"], first_token_s))
+        return [c for c in completed if c is not None], chunk_len
 
     def _is_finished(self, state, token: int) -> bool:
         if len(state["output_tokens"]) >= state["target_output_len"]:
