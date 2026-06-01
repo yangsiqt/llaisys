@@ -1251,8 +1251,13 @@ void Qwen2TPModel::apply_layer_slots_decode(size_t layer_idx, std::vector<tensor
 
         tensor_t attn_out = meta.attn_out->slice(0, 0, batch_size);
         if (paged_kv_mode_) {
-            ops::self_attention_paged_slots_decode(attn_out, q, kv_cache.k_cache, kv_cache.v_cache,
-                                                   meta.block_tables, slot_ids_t, seq_lens_t, scale);
+            if (env_flag_enabled("LLAISYS_PAGED_GQA_ATTN")) {
+                ops::self_attention_paged_gqa_slots_decode(attn_out, q, kv_cache.k_cache, kv_cache.v_cache,
+                                                           meta.block_tables, slot_ids_t, seq_lens_t, scale);
+            } else {
+                ops::self_attention_paged_slots_decode(attn_out, q, kv_cache.k_cache, kv_cache.v_cache,
+                                                       meta.block_tables, slot_ids_t, seq_lens_t, scale);
+            }
         } else if (env_flag_enabled("LLAISYS_GQA_ATTN")) {
             ops::self_attention_gqa_slots_decode(attn_out, q, kv_cache.k_cache, kv_cache.v_cache,
                                                  slot_ids_t, seq_lens_t, scale);

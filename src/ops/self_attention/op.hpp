@@ -13,4 +13,7 @@ void self_attention_gqa_slots_decode(tensor_t attn_val, tensor_t q, tensor_t k_c
 void self_attention_paged_slots_decode(tensor_t attn_val, tensor_t q, tensor_t k_cache, tensor_t v_cache,
                                        tensor_t block_tables, tensor_t slot_ids, tensor_t seq_lens,
                                        float scale);
+void self_attention_paged_gqa_slots_decode(tensor_t attn_val, tensor_t q, tensor_t k_cache, tensor_t v_cache,
+                                           tensor_t block_tables, tensor_t slot_ids, tensor_t seq_lens,
+                                           float scale);
 }

@@ -200,4 +200,49 @@ void self_attention_paged_slots_decode(tensor_t attn_val, tensor_t q, tensor_t k
         EXCEPTION_UNSUPPORTED_DEVICE;
     }
 }
+
+void self_attention_paged_gqa_slots_decode(tensor_t attn_val, tensor_t q, tensor_t k_cache, tensor_t v_cache,
+                                           tensor_t block_tables, tensor_t slot_ids, tensor_t seq_lens,
+                                           float scale) {
+    CHECK_SAME_DEVICE(attn_val, q, k_cache, v_cache, block_tables, slot_ids, seq_lens);
+    CHECK_SAME_DTYPE(attn_val->dtype(), q->dtype(), k_cache->dtype(), v_cache->dtype());
+    CHECK_ARGUMENT(q->ndim() == 3, "q must be 3D [batch, n_heads, head_dim]");
+    CHECK_ARGUMENT(k_cache->ndim() == 4, "paged k_cache must be 4D [max_blocks, block_size, n_kv_heads, head_dim]");
+    CHECK_ARGUMENT(v_cache->ndim() == 4, "paged v_cache must be 4D [max_blocks, block_size, n_kv_heads, head_dim]");
+    CHECK_ARGUMENT(block_tables->ndim() == 2, "block_tables must be 2D [max_slots, max_blocks_per_slot]");
+    CHECK_ARGUMENT(slot_ids->dtype() == LLAISYS_DTYPE_I64 && seq_lens->dtype() == LLAISYS_DTYPE_I64 &&
+                   block_tables->dtype() == LLAISYS_DTYPE_I64, "paged metadata must be int64");
+    CHECK_ARGUMENT(attn_val->isContiguous() && q->isContiguous() && k_cache->isContiguous() &&
+                   v_cache->isContiguous() && block_tables->isContiguous() &&
+                   slot_ids->isContiguous() && seq_lens->isContiguous(),
+                   "paged GQA attention tensors must be contiguous");
+
+    size_t batch_size = q->shape()[0];
+    size_t n_heads = q->shape()[1];
+    size_t head_dim = q->shape()[2];
+    size_t block_size = k_cache->shape()[1];
+    size_t n_kv_heads = k_cache->shape()[2];
+    CHECK_ARGUMENT(k_cache->shape() == v_cache->shape(), "paged K/V cache mismatch");
+    CHECK_ARGUMENT(k_cache->shape()[3] == head_dim, "paged head_dim mismatch");
+    CHECK_ARGUMENT(n_heads % n_kv_heads == 0, "n_heads must be divisible by n_kv_heads");
+    CHECK_ARGUMENT(attn_val->shape()[0] == batch_size && attn_val->shape()[1] == n_heads &&
+                   attn_val->shape()[2] == head_dim, "attn_val shape mismatch");
+    CHECK_ARGUMENT(slot_ids->shape()[0] == batch_size && seq_lens->shape()[0] == batch_size,
+                   "paged metadata batch mismatch");
+
+    llaisys::core::context().setDevice(attn_val->deviceType(), attn_val->deviceId());
+    switch (attn_val->deviceType()) {
+#ifdef ENABLE_NVIDIA_API
+    case LLAISYS_DEVICE_NVIDIA:
+        return nvidia::self_attention_paged_gqa_slots_decode(
+            attn_val->data(), q->data(), k_cache->data(), v_cache->data(),
+            reinterpret_cast<const int64_t *>(block_tables->data()),
+            reinterpret_cast<const int64_t *>(slot_ids->data()),
+            reinterpret_cast<const int64_t *>(seq_lens->data()), scale, attn_val->dtype(), batch_size,
+            block_tables->shape()[1], block_size, n_heads, n_kv_heads, head_dim);
+#endif
+    default:
+        EXCEPTION_UNSUPPORTED_DEVICE;
+    }
+}
 } // namespace llaisys::ops
