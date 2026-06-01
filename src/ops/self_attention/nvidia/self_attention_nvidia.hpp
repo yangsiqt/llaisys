@@ -15,4 +15,11 @@ void self_attention_gqa_slots_decode(std::byte *attn_val, const std::byte *q, co
                                      const std::byte *v_cache, const int64_t *slot_ids, const int64_t *seq_lens,
                                      float scale, llaisysDataType_t type, size_t batch_size, size_t maxseq,
                                      size_t n_heads, size_t n_kv_heads, size_t head_dim);
+void self_attention_paged_slots_decode(std::byte *attn_val, const std::byte *q,
+                                       const std::byte *k_cache, const std::byte *v_cache,
+                                       const int64_t *block_tables, const int64_t *slot_ids,
+                                       const int64_t *seq_lens, float scale, llaisysDataType_t type,
+                                       size_t batch_size, size_t max_blocks_per_slot,
+                                       size_t block_size, size_t n_heads, size_t n_kv_heads,
+                                       size_t head_dim);
 }

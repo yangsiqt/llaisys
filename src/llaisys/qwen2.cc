@@ -275,6 +275,14 @@ int llaisysQwen2TPModelInitContinuous(struct LlaisysQwen2TPModel *model, size_t 
     return 0;
 }
 
+int llaisysQwen2TPModelInitPagedContinuous(struct LlaisysQwen2TPModel *model, size_t max_slots,
+                                           size_t block_size, size_t max_blocks,
+                                           size_t prefill_scratch_slots) {
+    if (!model || !model->model) return -1;
+    model->model->init_paged_continuous(max_slots, block_size, max_blocks, prefill_scratch_slots);
+    return 0;
+}
+
 int64_t llaisysQwen2TPModelPrefillSlot(struct LlaisysQwen2TPModel *model, size_t slot_id,
                                        int64_t *token_ids, size_t ntoken) {
     if (!model || !model->model || !token_ids || ntoken == 0) return -1;
@@ -321,6 +329,19 @@ int llaisysQwen2TPModelReleaseSlot(struct LlaisysQwen2TPModel *model, size_t slo
 size_t llaisysQwen2TPModelSlotSeqLen(struct LlaisysQwen2TPModel *model, size_t slot_id) {
     if (!model || !model->model) return 0;
     return model->model->slot_seq_len(slot_id);
+}
+
+int llaisysQwen2TPModelPagedKVStats(struct LlaisysQwen2TPModel *model,
+                                    struct LlaisysQwen2PagedKVStats *stats) {
+    if (!model || !model->model || !stats) return -1;
+    auto s = model->model->paged_kv_stats();
+    stats->block_size = s.block_size;
+    stats->max_blocks = s.max_blocks;
+    stats->used_blocks = s.used_blocks;
+    stats->peak_used_blocks = s.peak_used_blocks;
+    stats->free_blocks = s.free_blocks;
+    stats->kv_capacity_tokens = s.kv_capacity_tokens;
+    return 0;
 }
 
 int llaisysQwen2TPModelGetTPSize(struct LlaisysQwen2TPModel *model) {

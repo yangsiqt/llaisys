@@ -214,6 +214,10 @@ def run_one(model, args, arrival_rate, device_ids):
         max_slots=args.max_slots,
         eos_token_id=eos_token_id,
         ignore_eos=args.ignore_eos,
+        kv_mode=args.kv_mode,
+        paged_block_size=args.paged_block_size,
+        paged_max_blocks=args.paged_max_blocks,
+        paged_prefill_scratch_slots=args.paged_prefill_scratch_slots,
     )
     sampler = GpuMemPeakSampler(device_ids)
     waiting = []
@@ -264,6 +268,8 @@ def run_one(model, args, arrival_rate, device_ids):
                 keep = []
                 used_prefill_tokens = 0
                 max_prefill_batch = args.max_prefill_batch if args.max_prefill_batch > 0 else free_slots
+                if args.kv_mode == "paged":
+                    max_prefill_batch = min(max_prefill_batch, args.paged_prefill_scratch_slots)
                 for req in waiting:
                     same_len = req["prompt_len"] == first_len
                     under_batch = len(batch) < min(free_slots, max_prefill_batch)
@@ -359,8 +365,9 @@ def run_one(model, args, arrival_rate, device_ids):
         else 0.0
     )
 
-    return {
+    row = {
         "arrival_rate": arrival_rate,
+        "kv_mode": args.kv_mode,
         "qps": len(completed) / wall_s if wall_s > 0 else 0.0,
         "completed": len(completed),
         "output_tok_s": output_tokens / wall_s if wall_s > 0 else 0.0,
@@ -397,6 +404,18 @@ def run_one(model, args, arrival_rate, device_ids):
         "chunked_prefill_tokens": args.chunked_prefill_tokens,
         "prefill_bucket_size": args.prefill_bucket_size,
     }
+    row.update(
+        {
+            "block_size": engine_metrics.get("paged_block_size", 0),
+            "max_blocks": engine_metrics.get("paged_max_blocks", 0),
+            "used_blocks": engine_metrics.get("paged_used_blocks", 0),
+            "peak_used_blocks": engine_metrics.get("paged_peak_used_blocks", 0),
+            "free_blocks": engine_metrics.get("paged_free_blocks", 0),
+            "kv_capacity_tokens": engine_metrics.get("paged_kv_capacity_tokens", 0),
+            "block_utilization": engine_metrics.get("paged_block_utilization", 0.0),
+        }
+    )
+    return row
 
 
 def print_summary(row):
@@ -408,6 +427,12 @@ def print_summary(row):
         f"active avg/max={row['avg_active']:.1f}/{row['max_active']} | "
         f"waiting avg/max={row['avg_waiting']:.1f}/{row['max_waiting']} | mem={row['peak_mem_mib']} MiB"
     )
+    if row["kv_mode"] == "paged":
+        print(
+            f"  paged kv: block_size={row['block_size']} max_blocks={row['max_blocks']} "
+            f"used/peak/free={row['used_blocks']}/{row['peak_used_blocks']}/{row['free_blocks']} "
+            f"capacity_tokens={row['kv_capacity_tokens']} utilization={row['block_utilization']:.3f}"
+        )
     print(
         f"  profile: wall={row['wall_s']:.2f}s | prompt avg/p90={row['prompt_len_avg']:.1f}/{row['prompt_len_p90']:.0f} | "
         f"prefill calls={row['prefill_calls']} avg_batch={row['prefill_batch_avg']:.2f} "
@@ -424,6 +449,10 @@ def main():
     parser.add_argument("--model", required=True, type=str)
     parser.add_argument("--device_ids", default="0", type=str)
     parser.add_argument("--max_slots", default=8, type=int)
+    parser.add_argument("--kv_mode", default="fixed", choices=["fixed", "paged"])
+    parser.add_argument("--paged_block_size", default=16, type=int)
+    parser.add_argument("--paged_max_blocks", default=0, type=int)
+    parser.add_argument("--paged_prefill_scratch_slots", default=1, type=int)
     parser.add_argument("--arrival_rates", default="0.5,1,2", type=str)
     parser.add_argument("--duration", default=30.0, type=float)
     parser.add_argument("--prompt_lens", default="128", type=str)
@@ -450,6 +479,13 @@ def main():
     eos_group.add_argument("--ignore_eos", dest="ignore_eos", action="store_true", default=True)
     eos_group.add_argument("--respect_eos", dest="ignore_eos", action="store_false")
     args = parser.parse_args()
+    if args.kv_mode == "paged":
+        if len(parse_int_list(args.device_ids)) != 1:
+            raise ValueError("kv_mode=paged is TP=1 only in the MVP")
+        if args.paged_max_blocks <= 0:
+            raise ValueError("--paged_max_blocks must be > 0 when --kv_mode paged")
+        if args.chunked_prefill_tokens > 0:
+            raise ValueError("--chunked_prefill_tokens is not supported with --kv_mode paged in the MVP")
     if not args.csv:
         DEFAULT_RESULT_DIR.mkdir(parents=True, exist_ok=True)
         args.csv = str(DEFAULT_RESULT_DIR / "bench_online_cb.csv")
@@ -475,6 +511,7 @@ def main():
 
     fields = [
         "arrival_rate",
+        "kv_mode",
         "qps",
         "completed",
         "output_tok_s",
@@ -510,6 +547,13 @@ def main():
         "max_prefill_batch",
         "chunked_prefill_tokens",
         "prefill_bucket_size",
+        "block_size",
+        "max_blocks",
+        "used_blocks",
+        "peak_used_blocks",
+        "free_blocks",
+        "kv_capacity_tokens",
+        "block_utilization",
     ]
     with open(args.csv, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fields)

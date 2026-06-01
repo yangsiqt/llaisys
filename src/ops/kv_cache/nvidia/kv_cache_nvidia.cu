@@ -133,6 +133,99 @@ __global__ void split_gate_up_decode_kernel(T *gate, T *up, const T *gate_up,
     }
 }
 
+template <typename T>
+__global__ void copy_kv_slots_to_blocks_kernel(T *block_k_cache, T *block_v_cache,
+                                               const T *scratch_k_cache, const T *scratch_v_cache,
+                                               const int64_t *block_tables, const int64_t *real_slot_ids,
+                                               const int64_t *scratch_slot_ids, size_t seq_len,
+                                               size_t max_blocks_per_slot, size_t scratch_maxseq,
+                                               size_t block_size, size_t n_kv_heads, size_t head_dim,
+                                               size_t batch_size) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t elems_per_token = n_kv_heads * head_dim;
+    size_t total = batch_size * seq_len * elems_per_token;
+    if (idx >= total) return;
+
+    size_t elem = idx % elems_per_token;
+    size_t token = (idx / elems_per_token) % seq_len;
+    size_t b = idx / (seq_len * elems_per_token);
+    size_t kv_h = elem / head_dim;
+    size_t d = elem - kv_h * head_dim;
+
+    int64_t real_slot = real_slot_ids[b];
+    int64_t scratch_slot = scratch_slot_ids[b];
+    if (real_slot < 0 || scratch_slot < 0) return;
+    size_t logical_block = token / block_size;
+    size_t block_offset = token % block_size;
+    int64_t physical_block = block_tables[(size_t)real_slot * max_blocks_per_slot + logical_block];
+    if (physical_block < 0) return;
+
+    size_t src = (((size_t)scratch_slot * scratch_maxseq + token) * n_kv_heads + kv_h) * head_dim + d;
+    size_t dst = (((size_t)physical_block * block_size + block_offset) * n_kv_heads + kv_h) * head_dim + d;
+    block_k_cache[dst] = scratch_k_cache[src];
+    block_v_cache[dst] = scratch_v_cache[src];
+}
+
+template <typename T>
+__global__ void rope_and_scatter_kv_paged_decode_kernel(T *q, T *k, const T *v,
+                                                        T *block_k_cache, T *block_v_cache,
+                                                        const int64_t *block_tables,
+                                                        const int64_t *pos_ids,
+                                                        const int64_t *slot_ids,
+                                                        const int64_t *positions,
+                                                        float theta, size_t batch_size,
+                                                        size_t max_blocks_per_slot, size_t block_size,
+                                                        size_t n_heads, size_t n_kv_heads,
+                                                        size_t head_dim, size_t max_heads) {
+    size_t half_dim = head_dim / 2;
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = batch_size * max_heads * half_dim;
+    if (idx >= total) return;
+
+    size_t j = idx % half_dim;
+    size_t h = (idx / half_dim) % max_heads;
+    size_t b = idx / (half_dim * max_heads);
+
+    int64_t pos_i64 = pos_ids[b];
+    int64_t slot_i64 = slot_ids[b];
+    int64_t cache_pos_i64 = positions[b];
+    if (pos_i64 < 0 || slot_i64 < 0 || cache_pos_i64 < 0) return;
+
+    float freq = (float)pos_i64 / powf(theta, (2.f * (float)j) / (float)head_dim);
+    float cos_f, sin_f;
+    __sincosf(freq, &sin_f, &cos_f);
+
+    if (h < n_heads) {
+        size_t q_base = (b * n_heads + h) * head_dim;
+        float a = kv_to_f(q[q_base + j]);
+        float c = kv_to_f(q[q_base + j + half_dim]);
+        q[q_base + j] = kv_from_f<T>(a * cos_f - c * sin_f);
+        q[q_base + j + half_dim] = kv_from_f<T>(c * cos_f + a * sin_f);
+    }
+
+    if (h < n_kv_heads) {
+        size_t kv_base = (b * n_kv_heads + h) * head_dim;
+        float a = kv_to_f(k[kv_base + j]);
+        float c = kv_to_f(k[kv_base + j + half_dim]);
+        T rk0 = kv_from_f<T>(a * cos_f - c * sin_f);
+        T rk1 = kv_from_f<T>(c * cos_f + a * sin_f);
+        k[kv_base + j] = rk0;
+        k[kv_base + j + half_dim] = rk1;
+
+        size_t slot = (size_t)slot_i64;
+        size_t cache_pos = (size_t)cache_pos_i64;
+        size_t logical_block = cache_pos / block_size;
+        size_t block_offset = cache_pos % block_size;
+        int64_t physical_block = block_tables[slot * max_blocks_per_slot + logical_block];
+        if (physical_block < 0) return;
+        size_t cache_base = (((size_t)physical_block * block_size + block_offset) * n_kv_heads + h) * head_dim;
+        block_k_cache[cache_base + j] = rk0;
+        block_k_cache[cache_base + j + half_dim] = rk1;
+        block_v_cache[cache_base + j] = v[kv_base + j];
+        block_v_cache[cache_base + j + half_dim] = v[kv_base + j + half_dim];
+    }
+}
+
 namespace llaisys::ops::nvidia {
 void scatter_kv_decode(std::byte *k_cache, std::byte *v_cache, const std::byte *k, const std::byte *v,
                        const int64_t *slot_ids, const int64_t *positions, llaisysDataType_t type,
@@ -197,6 +290,81 @@ void rope_and_scatter_kv_decode(std::byte *q, std::byte *k, const std::byte *v,
         break;
     default:
         throw std::runtime_error("Unsupported dtype for rope_and_scatter_kv_decode");
+    }
+}
+
+void copy_kv_slots_to_blocks(std::byte *block_k_cache, std::byte *block_v_cache,
+                             const std::byte *scratch_k_cache, const std::byte *scratch_v_cache,
+                             const int64_t *block_tables, const int64_t *real_slot_ids,
+                             const int64_t *scratch_slot_ids, llaisysDataType_t type,
+                             size_t batch_size, size_t seq_len, size_t max_blocks_per_slot,
+                             size_t scratch_maxseq, size_t block_size,
+                             size_t n_kv_heads, size_t head_dim) {
+    size_t total = batch_size * seq_len * n_kv_heads * head_dim;
+    int threads = 256;
+    dim3 blocks((unsigned)((total + threads - 1) / threads), 1, 1);
+    switch (type) {
+    case LLAISYS_DTYPE_F32:
+        copy_kv_slots_to_blocks_kernel<float><<<blocks, threads>>>(
+            reinterpret_cast<float *>(block_k_cache), reinterpret_cast<float *>(block_v_cache),
+            reinterpret_cast<const float *>(scratch_k_cache), reinterpret_cast<const float *>(scratch_v_cache),
+            block_tables, real_slot_ids, scratch_slot_ids, seq_len, max_blocks_per_slot, scratch_maxseq,
+            block_size, n_kv_heads, head_dim, batch_size);
+        break;
+    case LLAISYS_DTYPE_BF16:
+        copy_kv_slots_to_blocks_kernel<__nv_bfloat16><<<blocks, threads>>>(
+            reinterpret_cast<__nv_bfloat16 *>(block_k_cache), reinterpret_cast<__nv_bfloat16 *>(block_v_cache),
+            reinterpret_cast<const __nv_bfloat16 *>(scratch_k_cache), reinterpret_cast<const __nv_bfloat16 *>(scratch_v_cache),
+            block_tables, real_slot_ids, scratch_slot_ids, seq_len, max_blocks_per_slot, scratch_maxseq,
+            block_size, n_kv_heads, head_dim, batch_size);
+        break;
+    case LLAISYS_DTYPE_F16:
+        copy_kv_slots_to_blocks_kernel<__half><<<blocks, threads>>>(
+            reinterpret_cast<__half *>(block_k_cache), reinterpret_cast<__half *>(block_v_cache),
+            reinterpret_cast<const __half *>(scratch_k_cache), reinterpret_cast<const __half *>(scratch_v_cache),
+            block_tables, real_slot_ids, scratch_slot_ids, seq_len, max_blocks_per_slot, scratch_maxseq,
+            block_size, n_kv_heads, head_dim, batch_size);
+        break;
+    default:
+        throw std::runtime_error("Unsupported dtype for copy_kv_slots_to_blocks");
+    }
+}
+
+void rope_and_scatter_kv_paged_decode(std::byte *q, std::byte *k, const std::byte *v,
+                                      std::byte *block_k_cache, std::byte *block_v_cache,
+                                      const int64_t *block_tables, const int64_t *pos_ids,
+                                      const int64_t *slot_ids, const int64_t *positions,
+                                      float theta, llaisysDataType_t type, size_t batch_size,
+                                      size_t max_blocks_per_slot, size_t block_size,
+                                      size_t n_heads, size_t n_kv_heads, size_t head_dim) {
+    size_t max_heads = n_heads > n_kv_heads ? n_heads : n_kv_heads;
+    size_t total = batch_size * max_heads * (head_dim / 2);
+    int threads = 256;
+    dim3 blocks((unsigned)((total + threads - 1) / threads), 1, 1);
+    switch (type) {
+    case LLAISYS_DTYPE_F32:
+        rope_and_scatter_kv_paged_decode_kernel<float><<<blocks, threads>>>(
+            reinterpret_cast<float *>(q), reinterpret_cast<float *>(k), reinterpret_cast<const float *>(v),
+            reinterpret_cast<float *>(block_k_cache), reinterpret_cast<float *>(block_v_cache), block_tables,
+            pos_ids, slot_ids, positions, theta, batch_size, max_blocks_per_slot, block_size,
+            n_heads, n_kv_heads, head_dim, max_heads);
+        break;
+    case LLAISYS_DTYPE_BF16:
+        rope_and_scatter_kv_paged_decode_kernel<__nv_bfloat16><<<blocks, threads>>>(
+            reinterpret_cast<__nv_bfloat16 *>(q), reinterpret_cast<__nv_bfloat16 *>(k),
+            reinterpret_cast<const __nv_bfloat16 *>(v), reinterpret_cast<__nv_bfloat16 *>(block_k_cache),
+            reinterpret_cast<__nv_bfloat16 *>(block_v_cache), block_tables, pos_ids, slot_ids, positions,
+            theta, batch_size, max_blocks_per_slot, block_size, n_heads, n_kv_heads, head_dim, max_heads);
+        break;
+    case LLAISYS_DTYPE_F16:
+        rope_and_scatter_kv_paged_decode_kernel<__half><<<blocks, threads>>>(
+            reinterpret_cast<__half *>(q), reinterpret_cast<__half *>(k), reinterpret_cast<const __half *>(v),
+            reinterpret_cast<__half *>(block_k_cache), reinterpret_cast<__half *>(block_v_cache), block_tables,
+            pos_ids, slot_ids, positions, theta, batch_size, max_blocks_per_slot, block_size,
+            n_heads, n_kv_heads, head_dim, max_heads);
+        break;
+    default:
+        throw std::runtime_error("Unsupported dtype for rope_and_scatter_kv_paged_decode");
     }
 }
 

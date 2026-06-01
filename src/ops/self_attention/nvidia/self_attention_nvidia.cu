@@ -289,6 +289,122 @@ static void launch_slots_decode(T *attn_val, const T *q, const T *k_cache, const
         head_dim);
 }
 
+template <typename T, int BR>
+__global__ void self_attn_paged_slots_decode_kernel(T *attn_val, const T *q, const T *k_cache,
+                                                    const T *v_cache, const int64_t *block_tables,
+                                                    const int64_t *slot_ids, const int64_t *seq_lens,
+                                                    float scale, size_t batch_size,
+                                                    size_t max_blocks_per_slot, size_t block_size,
+                                                    size_t n_heads, size_t n_kv_heads, size_t head_dim) {
+    const size_t bi = blockIdx.x / n_heads;
+    const size_t h = blockIdx.x % n_heads;
+    if (bi >= batch_size) return;
+
+    const int64_t slot_i64 = slot_ids[bi];
+    const int64_t seq_i64 = seq_lens[bi];
+    if (slot_i64 < 0 || seq_i64 < 0) return;
+
+    const size_t slot_id = static_cast<size_t>(slot_i64);
+    const size_t kv_len = static_cast<size_t>(seq_i64) + 1;
+    const size_t kv_h = h / (n_heads / n_kv_heads);
+    const unsigned tid = threadIdx.x;
+
+    extern __shared__ unsigned char smem_u[];
+    float *const K_tile = reinterpret_cast<float *>(smem_u);
+    float *const V_tile = K_tile + BR * head_dim;
+    float *const S_tile = V_tile + BR * head_dim;
+    float *const Q_tile = S_tile + BR;
+    float *const O_acc = Q_tile + head_dim;
+
+    for (size_t d = tid; d < head_dim; d += blockDim.x)
+        Q_tile[d] = load_f(q, bi * n_heads * head_dim + h * head_dim + d);
+    __syncthreads();
+
+    float m = -FLT_MAX;
+    float l = 0.f;
+    for (size_t d = tid; d < head_dim; d += blockDim.x) O_acc[d] = 0.f;
+    __syncthreads();
+
+    for (int k0 = 0; k0 < (int)kv_len; k0 += BR) {
+        const int tile_len = min(BR, (int)kv_len - k0);
+        for (int idx = tid; idx < tile_len * (int)head_dim; idx += blockDim.x) {
+            const int b = idx / (int)head_dim;
+            const int d = idx % (int)head_dim;
+            const size_t ki = (size_t)k0 + (size_t)b;
+            const size_t logical_block = ki / block_size;
+            const size_t block_offset = ki % block_size;
+            const int64_t physical_block = block_tables[slot_id * max_blocks_per_slot + logical_block];
+            float kval = 0.f, vval = 0.f;
+            if (physical_block >= 0) {
+                const size_t off = (((size_t)physical_block * block_size + block_offset) * n_kv_heads + kv_h) *
+                                       head_dim + (size_t)d;
+                kval = load_f(k_cache, off);
+                vval = load_f(v_cache, off);
+            }
+            K_tile[b * (int)head_dim + d] = kval;
+            V_tile[b * (int)head_dim + d] = vval;
+        }
+        __syncthreads();
+
+        for (int b = tid; b < tile_len; b += blockDim.x) {
+            float sc = 0.f;
+            for (size_t d = 0; d < head_dim; d++)
+                sc += Q_tile[d] * K_tile[b * (int)head_dim + (int)d];
+            S_tile[b] = sc * scale;
+        }
+        __syncthreads();
+
+        float local_max = -FLT_MAX;
+        for (int b = tid; b < tile_len; b += blockDim.x) local_max = fmaxf(local_max, S_tile[b]);
+        const float m_tile = block_reduce_max(local_max);
+        const float m_new = fmaxf(m, m_tile);
+        __syncthreads();
+
+        for (int b = tid; b < tile_len; b += blockDim.x) S_tile[b] = expf(S_tile[b] - m_new);
+        __syncthreads();
+
+        float local_sum = 0.f;
+        for (int b = tid; b < tile_len; b += blockDim.x) local_sum += S_tile[b];
+        const float sum_p = block_reduce_sum(local_sum);
+        const float alpha = expf(m - m_new);
+        const float l_new = alpha * l + sum_p;
+
+        for (size_t d = tid; d < head_dim; d += blockDim.x) {
+            float pv = 0.f;
+            for (int b = 0; b < tile_len; b++)
+                pv += S_tile[b] * V_tile[b * (int)head_dim + (int)d];
+            O_acc[d] = O_acc[d] * alpha + pv;
+        }
+        __syncthreads();
+        m = m_new;
+        l = l_new;
+    }
+
+    const float inv_l = (l > 0.f) ? (1.f / l) : 0.f;
+    for (size_t d = tid; d < head_dim; d += blockDim.x) {
+        store_f(attn_val, bi * n_heads * head_dim + h * head_dim + d, O_acc[d] * inv_l);
+    }
+}
+
+template <typename T, int BR>
+static void launch_paged_slots_decode(T *attn_val, const T *q, const T *k_cache, const T *v_cache,
+                                      const int64_t *block_tables, const int64_t *slot_ids,
+                                      const int64_t *seq_lens, float scale, size_t batch_size,
+                                      size_t max_blocks_per_slot, size_t block_size, size_t n_heads,
+                                      size_t n_kv_heads, size_t head_dim) {
+    const int blocks = (int)(batch_size * n_heads);
+    const int threads = 256;
+    const size_t smem_bytes =
+        (size_t)BR * head_dim * sizeof(float) * 2 + (size_t)BR * sizeof(float) + head_dim * sizeof(float) * 2;
+    if (smem_bytes > 48u * 1024u) {
+        cudaFuncSetAttribute(self_attn_paged_slots_decode_kernel<T, BR>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);
+    }
+    self_attn_paged_slots_decode_kernel<T, BR><<<blocks, threads, smem_bytes>>>(
+        attn_val, q, k_cache, v_cache, block_tables, slot_ids, seq_lens, scale, batch_size,
+        max_blocks_per_slot, block_size, n_heads, n_kv_heads, head_dim);
+}
+
 template <typename T, int BR, int MAX_GROUP>
 __global__ void self_attn_gqa_slots_decode_kernel(T *attn_val, const T *q, const T *k_cache, const T *v_cache,
                                                   const int64_t *slot_ids, const int64_t *seq_lens, float scale,
@@ -592,6 +708,65 @@ void self_attention_gqa_slots_decode(std::byte *attn_val, const std::byte *q, co
     default:
         throw std::runtime_error("Unsupported dtype for self_attention_gqa_slots_decode");
     }
+}
+
+void self_attention_paged_slots_decode(std::byte *attn_val, const std::byte *q,
+                                       const std::byte *k_cache, const std::byte *v_cache,
+                                       const int64_t *block_tables, const int64_t *slot_ids,
+                                       const int64_t *seq_lens, float scale, llaisysDataType_t type,
+                                       size_t batch_size, size_t max_blocks_per_slot,
+                                       size_t block_size, size_t n_heads, size_t n_kv_heads,
+                                       size_t head_dim) {
+    const size_t smem_br64 =
+        64u * head_dim * sizeof(float) * 2 + 64u * sizeof(float) + head_dim * sizeof(float) * 2;
+    const size_t smem_br32 =
+        32u * head_dim * sizeof(float) * 2 + 32u * sizeof(float) + head_dim * sizeof(float) * 2;
+    const bool use_br64 = head_dim == 128 && smem_br64 <= 96u * 1024u;
+    if (use_br64) {
+        switch (type) {
+        case LLAISYS_DTYPE_F32:
+            return launch_paged_slots_decode<float, 64>((float *)attn_val, (const float *)q,
+                                                        (const float *)k_cache, (const float *)v_cache,
+                                                        block_tables, slot_ids, seq_lens, scale, batch_size,
+                                                        max_blocks_per_slot, block_size, n_heads, n_kv_heads,
+                                                        head_dim);
+        case LLAISYS_DTYPE_BF16:
+            return launch_paged_slots_decode<__nv_bfloat16, 64>(
+                (__nv_bfloat16 *)attn_val, (const __nv_bfloat16 *)q, (const __nv_bfloat16 *)k_cache,
+                (const __nv_bfloat16 *)v_cache, block_tables, slot_ids, seq_lens, scale, batch_size,
+                max_blocks_per_slot, block_size, n_heads, n_kv_heads, head_dim);
+        case LLAISYS_DTYPE_F16:
+            return launch_paged_slots_decode<__half, 64>((__half *)attn_val, (const __half *)q,
+                                                        (const __half *)k_cache, (const __half *)v_cache,
+                                                        block_tables, slot_ids, seq_lens, scale, batch_size,
+                                                        max_blocks_per_slot, block_size, n_heads, n_kv_heads,
+                                                        head_dim);
+        default: break;
+        }
+    }
+    if (smem_br32 <= 48u * 1024u) {
+        switch (type) {
+        case LLAISYS_DTYPE_F32:
+            return launch_paged_slots_decode<float, 32>((float *)attn_val, (const float *)q,
+                                                        (const float *)k_cache, (const float *)v_cache,
+                                                        block_tables, slot_ids, seq_lens, scale, batch_size,
+                                                        max_blocks_per_slot, block_size, n_heads, n_kv_heads,
+                                                        head_dim);
+        case LLAISYS_DTYPE_BF16:
+            return launch_paged_slots_decode<__nv_bfloat16, 32>(
+                (__nv_bfloat16 *)attn_val, (const __nv_bfloat16 *)q, (const __nv_bfloat16 *)k_cache,
+                (const __nv_bfloat16 *)v_cache, block_tables, slot_ids, seq_lens, scale, batch_size,
+                max_blocks_per_slot, block_size, n_heads, n_kv_heads, head_dim);
+        case LLAISYS_DTYPE_F16:
+            return launch_paged_slots_decode<__half, 32>((__half *)attn_val, (const __half *)q,
+                                                        (const __half *)k_cache, (const __half *)v_cache,
+                                                        block_tables, slot_ids, seq_lens, scale, batch_size,
+                                                        max_blocks_per_slot, block_size, n_heads, n_kv_heads,
+                                                        head_dim);
+        default: break;
+        }
+    }
+    throw std::runtime_error("Unsupported dtype/shape for self_attention_paged_slots_decode");
 }
 
 } // namespace llaisys::ops::nvidia

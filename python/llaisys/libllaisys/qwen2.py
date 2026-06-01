@@ -45,6 +45,18 @@ class LlaisysQwen2Weights(Structure):
     ]
 
 
+class LlaisysQwen2PagedKVStats(Structure):
+    """C struct for paged KV cache statistics"""
+    _fields_ = [
+        ("block_size", c_size_t),
+        ("max_blocks", c_size_t),
+        ("used_blocks", c_size_t),
+        ("peak_used_blocks", c_size_t),
+        ("free_blocks", c_size_t),
+        ("kv_capacity_tokens", c_size_t),
+    ]
+
+
 # Opaque pointer to Qwen2Model
 llaisysQwen2Model_t = c_void_p
 
@@ -148,6 +160,15 @@ def load_qwen2(lib):
     ]
     lib.llaisysQwen2TPModelInitContinuous.restype = c_int
 
+    lib.llaisysQwen2TPModelInitPagedContinuous.argtypes = [
+        llaisysQwen2TPModel_t,
+        c_size_t,
+        c_size_t,
+        c_size_t,
+        c_size_t,
+    ]
+    lib.llaisysQwen2TPModelInitPagedContinuous.restype = c_int
+
     lib.llaisysQwen2TPModelPrefillSlot.argtypes = [
         llaisysQwen2TPModel_t,
         c_size_t,
@@ -196,6 +217,12 @@ def load_qwen2(lib):
         c_size_t,
     ]
     lib.llaisysQwen2TPModelSlotSeqLen.restype = c_size_t
+
+    lib.llaisysQwen2TPModelPagedKVStats.argtypes = [
+        llaisysQwen2TPModel_t,
+        POINTER(LlaisysQwen2PagedKVStats),
+    ]
+    lib.llaisysQwen2TPModelPagedKVStats.restype = c_int
 
     lib.llaisysQwen2TPModelGetTPSize.argtypes = [llaisysQwen2TPModel_t]
     lib.llaisysQwen2TPModelGetTPSize.restype = c_int

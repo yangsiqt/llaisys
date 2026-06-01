@@ -166,7 +166,10 @@ Qwen2TPModel::Qwen2TPModel(const Qwen2Config& config, llaisysDeviceType_t device
                             const std::vector<int>& device_ids)
     : config_(config), device_type_(device_type), device_ids_(device_ids),
       tp_size_(device_ids.size()), current_pos_(0), batch_size_(1),
-      max_slots_(1), continuous_ready_(false)
+      max_slots_(1), paged_kv_mode_(false), paged_block_size_(0),
+      paged_max_blocks_(0), paged_max_blocks_per_slot_(0),
+      prefill_scratch_slots_(0), paged_peak_used_blocks_(0),
+      continuous_ready_(false)
 #ifdef ENABLE_NVIDIA_API
       , decode_graph_ready_(false), decode_graph_batch_(0),
         decode_graph_(nullptr), decode_graph_exec_(nullptr)
@@ -240,12 +243,54 @@ void Qwen2TPModel::reset_cache() {
 
 void Qwen2TPModel::init_continuous(size_t max_slots) {
     CHECK_ARGUMENT(max_slots >= 1, "init_continuous: max_slots must be >= 1");
+    paged_kv_mode_ = false;
+    paged_block_size_ = 0;
+    paged_max_blocks_ = 0;
+    paged_max_blocks_per_slot_ = 0;
+    prefill_scratch_slots_ = 0;
+    slot_block_tables_.clear();
+    free_paged_blocks_.clear();
+    init_continuous_common(max_slots, max_slots);
+}
+
+void Qwen2TPModel::init_paged_continuous(size_t max_slots, size_t block_size,
+                                         size_t max_blocks, size_t prefill_scratch_slots) {
+    CHECK_ARGUMENT(tp_size_ == 1, "init_paged_continuous: TP=1 only in MVP");
+    CHECK_ARGUMENT(device_type_ == LLAISYS_DEVICE_NVIDIA, "init_paged_continuous: CUDA only in MVP");
+    CHECK_ARGUMENT(max_slots >= 1, "init_paged_continuous: max_slots must be >= 1");
+    CHECK_ARGUMENT(block_size >= 1, "init_paged_continuous: block_size must be >= 1");
+    CHECK_ARGUMENT(max_blocks >= 1, "init_paged_continuous: max_blocks must be >= 1");
+    paged_kv_mode_ = true;
+    paged_block_size_ = block_size;
+    paged_max_blocks_ = max_blocks;
+    paged_max_blocks_per_slot_ = (config_.maxseq + block_size - 1) / block_size;
+    prefill_scratch_slots_ = std::max<size_t>(1, prefill_scratch_slots);
+    prefill_scratch_slots_ = std::min(prefill_scratch_slots_, max_slots);
+    slot_block_tables_.assign(max_slots, std::vector<int64_t>(paged_max_blocks_per_slot_, -1));
+    reset_paged_blocks();
+
+    init_continuous_common(max_slots, prefill_scratch_slots_);
+
+    for (int rank = 0; rank < tp_size_; rank++) {
+        int dev_id = device_ids_[rank];
+        ensure_kv_cache(ranks_[rank], config_.nlayer, paged_max_blocks_, paged_block_size_,
+                        nkvh_per_rank_, config_.dh, config_.dtype, device_type_, dev_id);
+        ranks_[rank].paged_kv_caches.swap(ranks_[rank].kv_caches);
+        ensure_kv_cache(ranks_[rank], config_.nlayer, prefill_scratch_slots_, config_.maxseq,
+                        nkvh_per_rank_, config_.dh, config_.dtype, device_type_, dev_id);
+        decode_meta_[rank].block_tables = Tensor::create(
+            {max_slots_, paged_max_blocks_per_slot_}, LLAISYS_DTYPE_I64, device_type_, dev_id);
+        sync_paged_block_table(rank);
+    }
+}
+
+void Qwen2TPModel::init_continuous_common(size_t max_slots, size_t kv_slots) {
     max_slots_ = max_slots;
     batch_size_ = max_slots_;
     current_pos_ = 0;
     for (int rank = 0; rank < tp_size_; rank++) {
         int dev_id = device_ids_[rank];
-        ensure_kv_cache(ranks_[rank], config_.nlayer, max_slots_, config_.maxseq,
+        ensure_kv_cache(ranks_[rank], config_.nlayer, kv_slots, config_.maxseq,
                         nkvh_per_rank_, config_.dh, config_.dtype, device_type_, dev_id);
     }
     decode_meta_.resize(tp_size_);
@@ -309,8 +354,8 @@ int64_t Qwen2TPModel::prefill_slot(size_t slot_id, const std::vector<int64_t>& t
     CHECK_ARGUMENT(!token_ids.empty(), "prefill_slot: token_ids must not be empty");
     CHECK_ARGUMENT(token_ids.size() <= config_.maxseq, "prefill_slot: sequence length exceeds maxseq");
 
-    std::vector<size_t> slot_ids{slot_id};
-    tensor_t logits = forward_slots(token_ids, slot_ids, 0, token_ids.size());
+    std::vector<size_t> forward_slot_ids{paged_kv_mode_ ? 0 : slot_id};
+    tensor_t logits = forward_slots(token_ids, forward_slot_ids, 0, token_ids.size());
 
     int dev_id = device_ids_[0];
     core::context().setDevice(device_type_, dev_id);
@@ -328,6 +373,11 @@ int64_t Qwen2TPModel::prefill_slot(size_t slot_id, const std::vector<int64_t>& t
     slot_active_[slot_id] = 1;
     slot_seq_lens_[slot_id] = token_ids.size();
     slot_last_tokens_[slot_id] = next_token;
+    if (paged_kv_mode_) {
+        release_paged_blocks(slot_id);
+        allocate_paged_blocks_for_len(slot_id, token_ids.size());
+        copy_prefill_to_paged_cache({slot_id}, {0}, token_ids.size());
+    }
     return next_token;
 }
 
@@ -339,6 +389,7 @@ int64_t Qwen2TPModel::prefill_slot_chunk(size_t slot_id, const std::vector<int64
     CHECK_ARGUMENT(slot_seq_lens_[slot_id] + token_ids.size() <= config_.maxseq,
                    "prefill_slot_chunk: sequence length exceeds maxseq");
 
+    CHECK_ARGUMENT(!paged_kv_mode_, "prefill_slot_chunk: paged KV does not support chunked prefill in MVP");
     size_t start_pos = slot_seq_lens_[slot_id];
     std::vector<size_t> slot_ids{slot_id};
     tensor_t logits = forward_slots(token_ids, slot_ids, start_pos, token_ids.size());
@@ -380,7 +431,14 @@ std::vector<int64_t> Qwen2TPModel::prefill_slots(const std::vector<size_t>& slot
         CHECK_ARGUMENT(slot_id < max_slots_, "prefill_slots: invalid slot_id");
     }
 
-    tensor_t logits = forward_slots(token_ids, slot_ids, 0, prompt_len);
+    CHECK_ARGUMENT(!paged_kv_mode_ || slot_ids.size() <= prefill_scratch_slots_,
+                   "prefill_slots: batch exceeds paged scratch slots");
+    std::vector<size_t> forward_slot_ids = slot_ids;
+    if (paged_kv_mode_) {
+        forward_slot_ids.resize(slot_ids.size());
+        for (size_t i = 0; i < slot_ids.size(); i++) forward_slot_ids[i] = i;
+    }
+    tensor_t logits = forward_slots(token_ids, forward_slot_ids, 0, prompt_len);
 
     int dev_id = device_ids_[0];
     core::context().setDevice(device_type_, dev_id);
@@ -402,6 +460,13 @@ std::vector<int64_t> Qwen2TPModel::prefill_slots(const std::vector<size_t>& slot
         slot_seq_lens_[slot_id] = prompt_len;
         slot_last_tokens_[slot_id] = next_tokens[b];
     }
+    if (paged_kv_mode_) {
+        for (size_t slot_id : slot_ids) {
+            release_paged_blocks(slot_id);
+            allocate_paged_blocks_for_len(slot_id, prompt_len);
+        }
+        copy_prefill_to_paged_cache(slot_ids, forward_slot_ids, prompt_len);
+    }
     return next_tokens;
 }
 
@@ -421,6 +486,12 @@ std::vector<int64_t> Qwen2TPModel::decode_slots(const std::vector<size_t>& slot_
 
     std::vector<size_t> start_positions(slot_ids.size());
     for (size_t i = 0; i < slot_ids.size(); i++) start_positions[i] = slot_seq_lens_[slot_ids[i]];
+    if (paged_kv_mode_) {
+        for (size_t i = 0; i < slot_ids.size(); i++) {
+            ensure_paged_position_allocated(slot_ids[i], start_positions[i]);
+        }
+        for (int rank = 0; rank < tp_size_; rank++) sync_paged_block_table(rank);
+    }
 
     tensor_t logits = forward_slots_decode(input_tokens, slot_ids, start_positions);
 
@@ -455,11 +526,108 @@ void Qwen2TPModel::release_slot(size_t slot_id) {
     slot_active_[slot_id] = 0;
     slot_seq_lens_[slot_id] = 0;
     slot_last_tokens_[slot_id] = 0;
+    release_paged_blocks(slot_id);
 }
 
 size_t Qwen2TPModel::slot_seq_len(size_t slot_id) const {
     CHECK_ARGUMENT(slot_id < slot_seq_lens_.size(), "slot_seq_len: invalid slot_id");
     return slot_seq_lens_[slot_id];
+}
+
+void Qwen2TPModel::reset_paged_blocks() {
+    free_paged_blocks_.clear();
+    free_paged_blocks_.reserve(paged_max_blocks_);
+    for (size_t i = 0; i < paged_max_blocks_; i++) {
+        free_paged_blocks_.push_back(paged_max_blocks_ - 1 - i);
+    }
+    paged_peak_used_blocks_ = 0;
+    for (auto& table : slot_block_tables_) {
+        std::fill(table.begin(), table.end(), -1);
+    }
+}
+
+void Qwen2TPModel::release_paged_blocks(size_t slot_id) {
+    if (!paged_kv_mode_ || slot_id >= slot_block_tables_.size()) return;
+    for (auto& block : slot_block_tables_[slot_id]) {
+        if (block >= 0) {
+            free_paged_blocks_.push_back(static_cast<size_t>(block));
+            block = -1;
+        }
+    }
+    for (int rank = 0; rank < tp_size_; rank++) sync_paged_block_table(rank);
+}
+
+void Qwen2TPModel::ensure_paged_position_allocated(size_t slot_id, size_t position) {
+    CHECK_ARGUMENT(paged_kv_mode_, "paged KV is not enabled");
+    CHECK_ARGUMENT(slot_id < slot_block_tables_.size(), "invalid paged slot");
+    size_t logical_block = position / paged_block_size_;
+    CHECK_ARGUMENT(logical_block < paged_max_blocks_per_slot_, "paged position exceeds maxseq");
+    if (slot_block_tables_[slot_id][logical_block] >= 0) return;
+    CHECK_ARGUMENT(!free_paged_blocks_.empty(), "paged KV block OOM");
+    size_t physical_block = free_paged_blocks_.back();
+    free_paged_blocks_.pop_back();
+    slot_block_tables_[slot_id][logical_block] = static_cast<int64_t>(physical_block);
+    size_t used = paged_max_blocks_ - free_paged_blocks_.size();
+    paged_peak_used_blocks_ = std::max(paged_peak_used_blocks_, used);
+}
+
+void Qwen2TPModel::allocate_paged_blocks_for_len(size_t slot_id, size_t seq_len) {
+    for (size_t pos = 0; pos < seq_len; pos += paged_block_size_) {
+        ensure_paged_position_allocated(slot_id, pos);
+    }
+}
+
+void Qwen2TPModel::sync_paged_block_table(int rank) {
+    if (!paged_kv_mode_) return;
+    int dev_id = device_ids_[rank];
+    core::context().setDevice(device_type_, dev_id);
+    std::vector<int64_t> flat(max_slots_ * paged_max_blocks_per_slot_, -1);
+    for (size_t s = 0; s < max_slots_; s++) {
+        std::copy(slot_block_tables_[s].begin(), slot_block_tables_[s].end(),
+                  flat.begin() + s * paged_max_blocks_per_slot_);
+    }
+    decode_meta_[rank].block_tables->load(flat.data());
+}
+
+PagedKVStats Qwen2TPModel::paged_kv_stats() const {
+    PagedKVStats stats{};
+    stats.block_size = paged_block_size_;
+    stats.max_blocks = paged_max_blocks_;
+    stats.free_blocks = free_paged_blocks_.size();
+    stats.used_blocks = paged_max_blocks_ >= stats.free_blocks ? paged_max_blocks_ - stats.free_blocks : 0;
+    stats.peak_used_blocks = paged_peak_used_blocks_;
+    stats.kv_capacity_tokens = paged_max_blocks_ * paged_block_size_;
+    return stats;
+}
+
+void Qwen2TPModel::copy_prefill_to_paged_cache(const std::vector<size_t>& real_slot_ids,
+                                               const std::vector<size_t>& scratch_slot_ids,
+                                               size_t prompt_len) {
+    if (!paged_kv_mode_) return;
+    CHECK_ARGUMENT(real_slot_ids.size() == scratch_slot_ids.size(), "paged copy slot mismatch");
+    std::vector<int64_t> real_i64(real_slot_ids.size());
+    std::vector<int64_t> scratch_i64(scratch_slot_ids.size());
+    for (size_t i = 0; i < real_slot_ids.size(); i++) {
+        real_i64[i] = static_cast<int64_t>(real_slot_ids[i]);
+        scratch_i64[i] = static_cast<int64_t>(scratch_slot_ids[i]);
+    }
+    for (int rank = 0; rank < tp_size_; rank++) {
+        sync_paged_block_table(rank);
+        int dev_id = device_ids_[rank];
+        core::context().setDevice(device_type_, dev_id);
+        tensor_t real_t = Tensor::create({real_i64.size()}, LLAISYS_DTYPE_I64, device_type_, dev_id);
+        tensor_t scratch_t = Tensor::create({scratch_i64.size()}, LLAISYS_DTYPE_I64, device_type_, dev_id);
+        real_t->load(real_i64.data());
+        scratch_t->load(scratch_i64.data());
+        for (size_t layer = 0; layer < config_.nlayer; layer++) {
+            ops::copy_kv_slots_to_blocks(
+                ranks_[rank].paged_kv_caches[layer].k_cache,
+                ranks_[rank].paged_kv_caches[layer].v_cache,
+                ranks_[rank].kv_caches[layer].k_cache,
+                ranks_[rank].kv_caches[layer].v_cache,
+                decode_meta_[rank].block_tables, real_t, scratch_t, prompt_len);
+        }
+    }
 }
 
 void Qwen2TPModel::setInEmbed(int rank, const tensor_t& tensor) {
@@ -995,20 +1163,27 @@ void Qwen2TPModel::apply_layer_slots_decode(size_t layer_idx, std::vector<tensor
         for (size_t pos : start_positions) {
             CHECK_ARGUMENT(pos + 1 <= config_.maxseq, "decode kv_seq_len exceeds maxseq");
         }
-        auto& kv_cache = ranks_[rank].kv_caches[layer_idx];
+        auto& kv_cache = paged_kv_mode_ ? ranks_[rank].paged_kv_caches[layer_idx]
+                                        : ranks_[rank].kv_caches[layer_idx];
         tensor_t pos_ids = meta.pos_ids->slice(0, 0, batch_size);
         tensor_t slot_ids_t = meta.slot_ids->slice(0, 0, batch_size);
         tensor_t positions_t = meta.positions->slice(0, 0, batch_size);
         tensor_t seq_lens_t = meta.seq_lens->slice(0, 0, batch_size);
-        const char* fused_env = std::getenv("LLAISYS_FUSED_ROPE_SCATTER");
-        const bool use_fused = fused_env && std::atoi(fused_env) != 0;
-        if (use_fused) {
-            ops::rope_and_scatter_kv_decode(q, k, v, kv_cache.k_cache, kv_cache.v_cache,
-                                            pos_ids, slot_ids_t, positions_t, config_.theta);
+        if (paged_kv_mode_) {
+            ops::rope_and_scatter_kv_paged_decode(q, k, v, kv_cache.k_cache, kv_cache.v_cache,
+                                                  meta.block_tables, pos_ids, slot_ids_t,
+                                                  positions_t, config_.theta);
         } else {
-            ops::rope(q, q, pos_ids, config_.theta);
-            ops::rope(k, k, pos_ids, config_.theta);
-            ops::scatter_kv_decode(kv_cache.k_cache, kv_cache.v_cache, k, v, slot_ids_t, positions_t);
+            const char* fused_env = std::getenv("LLAISYS_FUSED_ROPE_SCATTER");
+            const bool use_fused = fused_env && std::atoi(fused_env) != 0;
+            if (use_fused) {
+                ops::rope_and_scatter_kv_decode(q, k, v, kv_cache.k_cache, kv_cache.v_cache,
+                                                pos_ids, slot_ids_t, positions_t, config_.theta);
+            } else {
+                ops::rope(q, q, pos_ids, config_.theta);
+                ops::rope(k, k, pos_ids, config_.theta);
+                ops::scatter_kv_decode(kv_cache.k_cache, kv_cache.v_cache, k, v, slot_ids_t, positions_t);
+            }
         }
         kv_cache.current_seq_len = 0;
         for (size_t pos : start_positions) {
@@ -1016,7 +1191,10 @@ void Qwen2TPModel::apply_layer_slots_decode(size_t layer_idx, std::vector<tensor
         }
 
         tensor_t attn_out = meta.attn_out->slice(0, 0, batch_size);
-        if (env_flag_enabled("LLAISYS_GQA_ATTN")) {
+        if (paged_kv_mode_) {
+            ops::self_attention_paged_slots_decode(attn_out, q, kv_cache.k_cache, kv_cache.v_cache,
+                                                   meta.block_tables, slot_ids_t, seq_lens_t, scale);
+        } else if (env_flag_enabled("LLAISYS_GQA_ATTN")) {
             ops::self_attention_gqa_slots_decode(attn_out, q, kv_cache.k_cache, kv_cache.v_cache,
                                                  slot_ids_t, seq_lens_t, scale);
         } else {

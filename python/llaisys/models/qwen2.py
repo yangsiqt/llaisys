@@ -1,6 +1,6 @@
 from typing import Sequence
 from ..libllaisys import LIB_LLAISYS
-from ..libllaisys.qwen2 import LlaisysQwen2Meta, llaisysQwen2Model_t
+from ..libllaisys.qwen2 import LlaisysQwen2Meta, LlaisysQwen2PagedKVStats, llaisysQwen2Model_t
 from ..libllaisys import DeviceType
 from ..libllaisys.llaisys_types import DataType
 from ..tensor import Tensor
@@ -772,6 +772,23 @@ class Qwen2TP:
         if rc != 0:
             raise RuntimeError("llaisysQwen2TPModelInitContinuous failed")
 
+    def init_paged_continuous(
+        self,
+        max_slots: int,
+        block_size: int,
+        max_blocks: int,
+        prefill_scratch_slots: int = 1,
+    ):
+        rc = LIB_LLAISYS.llaisysQwen2TPModelInitPagedContinuous(
+            self._model,
+            int(max_slots),
+            int(block_size),
+            int(max_blocks),
+            int(prefill_scratch_slots),
+        )
+        if rc != 0:
+            raise RuntimeError("llaisysQwen2TPModelInitPagedContinuous failed")
+
     def prefill_slot(self, slot_id: int, token_ids: Sequence[int]) -> int:
         token_array = (c_int64 * len(token_ids))(*token_ids)
         next_token = LIB_LLAISYS.llaisysQwen2TPModelPrefillSlot(
@@ -839,17 +856,45 @@ class Qwen2TP:
     def slot_seq_len(self, slot_id: int) -> int:
         return int(LIB_LLAISYS.llaisysQwen2TPModelSlotSeqLen(self._model, slot_id))
 
+    def paged_kv_stats(self):
+        stats = LlaisysQwen2PagedKVStats()
+        rc = LIB_LLAISYS.llaisysQwen2TPModelPagedKVStats(self._model, byref(stats))
+        if rc != 0:
+            raise RuntimeError("llaisysQwen2TPModelPagedKVStats failed")
+        max_blocks = int(stats.max_blocks)
+        used_blocks = int(stats.used_blocks)
+        return {
+            "block_size": int(stats.block_size),
+            "max_blocks": max_blocks,
+            "used_blocks": used_blocks,
+            "peak_used_blocks": int(stats.peak_used_blocks),
+            "free_blocks": int(stats.free_blocks),
+            "kv_capacity_tokens": int(stats.kv_capacity_tokens),
+            "block_utilization": (used_blocks / max_blocks) if max_blocks > 0 else 0.0,
+        }
+
     def __del__(self):
         if hasattr(self, "_model") and self._model:
             LIB_LLAISYS.llaisysQwen2TPModelDestroy(self._model)
 
 
 class Qwen2TPContinuousEngine:
-    """Fixed-slot continuous batching helper for online-serving benchmarks."""
+    """Continuous batching helper for online-serving benchmarks."""
 
-    def __init__(self, model: Qwen2TP, max_slots: int, eos_token_id=None, ignore_eos: bool = True):
+    def __init__(
+        self,
+        model: Qwen2TP,
+        max_slots: int,
+        eos_token_id=None,
+        ignore_eos: bool = True,
+        kv_mode: str = "fixed",
+        paged_block_size: int = 16,
+        paged_max_blocks: int = 0,
+        paged_prefill_scratch_slots: int = 1,
+    ):
         self.model = model
         self.max_slots = int(max_slots)
+        self.kv_mode = kv_mode
         self.eos_token_id = eos_token_id if eos_token_id is not None else model._config.get("eos_token_id")
         self.ignore_eos = ignore_eos
         self.free_slots = list(range(self.max_slots))
@@ -867,7 +912,19 @@ class Qwen2TPContinuousEngine:
             "decode_slot_steps": 0,
             "decode_max_batch": 0,
         }
-        self.model.init_continuous(self.max_slots)
+        if kv_mode == "fixed":
+            self.model.init_continuous(self.max_slots)
+        elif kv_mode == "paged":
+            if paged_max_blocks <= 0:
+                raise ValueError("paged_max_blocks must be > 0 when kv_mode=paged")
+            self.model.init_paged_continuous(
+                self.max_slots,
+                paged_block_size,
+                paged_max_blocks,
+                paged_prefill_scratch_slots,
+            )
+        else:
+            raise ValueError(f"unsupported kv_mode: {kv_mode}")
 
     def can_accept(self) -> bool:
         return bool(self.free_slots)
@@ -942,6 +999,8 @@ class Qwen2TPContinuousEngine:
         return [c for c in completed if c is not None]
 
     def start_prefill_chunked(self, request, chunk_tokens: int, now_s: float):
+        if self.kv_mode == "paged":
+            raise ValueError("chunked prefill is not supported with kv_mode=paged in the MVP")
         if not self.free_slots:
             return [], 0
         slot_id = self.free_slots.pop(0)
@@ -1016,7 +1075,10 @@ class Qwen2TPContinuousEngine:
         return len(self.prefilling)
 
     def metrics(self):
-        return dict(self.stats)
+        out = dict(self.stats)
+        if self.kv_mode == "paged":
+            out.update({f"paged_{k}": v for k, v in self.model.paged_kv_stats().items()})
+        return out
 
     def _run_prefill_chunk(self, state, max_tokens: int):
         import time

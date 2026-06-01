@@ -13,6 +13,16 @@ namespace models {
 struct Qwen2TPRankData {
     Qwen2Weights weights;
     std::vector<KVCache> kv_caches;
+    std::vector<KVCache> paged_kv_caches;
+};
+
+struct PagedKVStats {
+    size_t block_size;
+    size_t max_blocks;
+    size_t used_blocks;
+    size_t peak_used_blocks;
+    size_t free_blocks;
+    size_t kv_capacity_tokens;
 };
 
 class Qwen2TPModel {
@@ -34,6 +44,8 @@ public:
     void reset_cache();
 
     void init_continuous(size_t max_slots);
+    void init_paged_continuous(size_t max_slots, size_t block_size,
+                               size_t max_blocks, size_t prefill_scratch_slots);
     int64_t prefill_slot(size_t slot_id, const std::vector<int64_t>& token_ids);
     int64_t prefill_slot_chunk(size_t slot_id, const std::vector<int64_t>& token_ids, bool final_chunk);
     std::vector<int64_t> prefill_slots(const std::vector<size_t>& slot_ids,
@@ -43,6 +55,7 @@ public:
                                       const std::vector<int64_t>& input_tokens);
     void release_slot(size_t slot_id);
     size_t slot_seq_len(size_t slot_id) const;
+    PagedKVStats paged_kv_stats() const;
 
 private:
     Qwen2Config config_;
@@ -59,10 +72,18 @@ private:
     size_t current_pos_;
     size_t batch_size_;
     size_t max_slots_;
+    bool paged_kv_mode_;
+    size_t paged_block_size_;
+    size_t paged_max_blocks_;
+    size_t paged_max_blocks_per_slot_;
+    size_t prefill_scratch_slots_;
+    size_t paged_peak_used_blocks_;
     bool continuous_ready_;
     std::vector<uint8_t> slot_active_;
     std::vector<size_t> slot_seq_lens_;
     std::vector<int64_t> slot_last_tokens_;
+    std::vector<std::vector<int64_t>> slot_block_tables_;
+    std::vector<size_t> free_paged_blocks_;
     struct DecodeMetaBuffers {
         tensor_t slot_ids;
         tensor_t positions;
@@ -91,6 +112,7 @@ private:
         tensor_t mlp_out;
         tensor_t out_norm;
         tensor_t logits;
+        tensor_t block_tables;
     };
     std::vector<DecodeMetaBuffers> decode_meta_;
 
@@ -117,6 +139,15 @@ private:
                                   const std::vector<size_t>& slot_ids,
                                   const std::vector<size_t>& start_positions);
     void allreduce_sum(std::vector<tensor_t>& tensors);
+    void init_continuous_common(size_t max_slots, size_t kv_slots);
+    void reset_paged_blocks();
+    void release_paged_blocks(size_t slot_id);
+    void ensure_paged_position_allocated(size_t slot_id, size_t position);
+    void allocate_paged_blocks_for_len(size_t slot_id, size_t seq_len);
+    void sync_paged_block_table(int rank);
+    void copy_prefill_to_paged_cache(const std::vector<size_t>& real_slot_ids,
+                                     const std::vector<size_t>& scratch_slot_ids,
+                                     size_t prompt_len);
 };
 
 } // namespace models
