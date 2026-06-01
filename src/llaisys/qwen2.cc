@@ -168,9 +168,19 @@ void llaisysQwen2ModelSetLayerWeight(struct LlaisysQwen2Model *model, const char
 
 int64_t llaisysQwen2ModelInfer(struct LlaisysQwen2Model *model, int64_t *token_ids, size_t ntoken) {
     if (!model || !model->model) return -1;
-    
+
     std::vector<int64_t> tokens(token_ids, token_ids + ntoken);
     return model->model->infer(tokens);
+}
+
+int llaisysQwen2ModelInferBatch(struct LlaisysQwen2Model *model, int64_t *token_ids, size_t ntoken,
+                                 int64_t *out, size_t batch_size) {
+    if (!model || !model->model) return -1;
+
+    std::vector<int64_t> tokens(token_ids, token_ids + ntoken);
+    auto result = model->model->infer_batch(tokens, batch_size);
+    for (size_t i = 0; i < result.size(); i++) out[i] = result[i];
+    return 0;
 }
 
 // --- Tensor Parallel API ---
@@ -248,6 +258,60 @@ int64_t llaisysQwen2TPModelInfer(struct LlaisysQwen2TPModel *model, int64_t *tok
     if (!model || !model->model) return -1;
     std::vector<int64_t> tokens(token_ids, token_ids + ntoken);
     return model->model->infer(tokens);
+}
+
+int llaisysQwen2TPModelInferBatch(struct LlaisysQwen2TPModel *model, int64_t *token_ids, size_t ntoken,
+                                   int64_t *out, size_t batch_size) {
+    if (!model || !model->model) return -1;
+    std::vector<int64_t> tokens(token_ids, token_ids + ntoken);
+    auto result = model->model->infer_batch(tokens, batch_size);
+    for (size_t i = 0; i < result.size(); i++) out[i] = result[i];
+    return 0;
+}
+
+int llaisysQwen2TPModelInitContinuous(struct LlaisysQwen2TPModel *model, size_t max_slots) {
+    if (!model || !model->model) return -1;
+    model->model->init_continuous(max_slots);
+    return 0;
+}
+
+int64_t llaisysQwen2TPModelPrefillSlot(struct LlaisysQwen2TPModel *model, size_t slot_id,
+                                       int64_t *token_ids, size_t ntoken) {
+    if (!model || !model->model || !token_ids || ntoken == 0) return -1;
+    std::vector<int64_t> tokens(token_ids, token_ids + ntoken);
+    return model->model->prefill_slot(slot_id, tokens);
+}
+
+int llaisysQwen2TPModelPrefillSlots(struct LlaisysQwen2TPModel *model, size_t *slot_ids,
+                                    int64_t *token_ids, int64_t *out, size_t nslot,
+                                    size_t prompt_len) {
+    if (!model || !model->model || !slot_ids || !token_ids || !out || nslot == 0 || prompt_len == 0) return -1;
+    std::vector<size_t> slots(slot_ids, slot_ids + nslot);
+    std::vector<int64_t> tokens(token_ids, token_ids + nslot * prompt_len);
+    auto result = model->model->prefill_slots(slots, tokens, prompt_len);
+    for (size_t i = 0; i < result.size(); i++) out[i] = result[i];
+    return 0;
+}
+
+int llaisysQwen2TPModelDecodeSlots(struct LlaisysQwen2TPModel *model, size_t *slot_ids,
+                                   int64_t *input_tokens, int64_t *out, size_t nslot) {
+    if (!model || !model->model || !slot_ids || !input_tokens || !out || nslot == 0) return -1;
+    std::vector<size_t> slots(slot_ids, slot_ids + nslot);
+    std::vector<int64_t> tokens(input_tokens, input_tokens + nslot);
+    auto result = model->model->decode_slots(slots, tokens);
+    for (size_t i = 0; i < result.size(); i++) out[i] = result[i];
+    return 0;
+}
+
+int llaisysQwen2TPModelReleaseSlot(struct LlaisysQwen2TPModel *model, size_t slot_id) {
+    if (!model || !model->model) return -1;
+    model->model->release_slot(slot_id);
+    return 0;
+}
+
+size_t llaisysQwen2TPModelSlotSeqLen(struct LlaisysQwen2TPModel *model, size_t slot_id) {
+    if (!model || !model->model) return 0;
+    return model->model->slot_seq_len(slot_id);
 }
 
 int llaisysQwen2TPModelGetTPSize(struct LlaisysQwen2TPModel *model) {

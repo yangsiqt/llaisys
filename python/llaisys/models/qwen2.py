@@ -275,6 +275,95 @@ class Qwen2:
 
         return output_tokens
 
+    def generate_with_pd_metrics_batch(
+        self,
+        inputs_batch,
+        max_new_tokens: int = None,
+        top_k: int = 1,
+        top_p: float = 0.8,
+        temperature: float = 0.8,
+    ):
+        import sys
+        import time
+
+        if max_new_tokens is None:
+            max_new_tokens = 128
+        if top_k != 1:
+            print("Warning: Only greedy sampling (top_k=1) is currently supported")
+
+        bs = len(inputs_batch)
+        max_prompt_len = max(len(p) for p in inputs_batch)
+
+        padded = []
+        for p in inputs_batch:
+            pad_token = p[0] if p else 0
+            padded_p = [pad_token] * (max_prompt_len - len(p)) + p
+            padded.append(padded_p)
+
+        outputs = [list(p) for p in padded]
+        n_prompt_per_seq = max_prompt_len
+
+        t_wall0 = time.perf_counter()
+        prefill_s = 0.0
+        sum_decode_kernel_s = 0.0
+        n_gen = 0
+
+        for step in range(max_new_tokens):
+            current_len = n_prompt_per_seq + step
+            token_array = (c_int64 * (bs * current_len))()
+            for b in range(bs):
+                base = b * current_len
+                for i, tok in enumerate(outputs[b]):
+                    token_array[base + i] = tok
+
+            t0 = time.perf_counter()
+            next_arr = (c_int64 * bs)()
+            LIB_LLAISYS.llaisysQwen2ModelInferBatch(
+                self._model, token_array, bs * current_len, next_arr, bs
+            )
+            dt = time.perf_counter() - t0
+
+            if step == 0:
+                prefill_s = dt / bs
+            else:
+                sum_decode_kernel_s += dt
+
+            done = [False] * bs
+            for b in range(bs):
+                if next_arr[b] == self._config["eos_token_id"]:
+                    outputs[b].append(int(next_arr[b]))
+                    done[b] = True
+                else:
+                    outputs[b].append(int(next_arr[b]))
+
+            n_gen += 1
+            if all(done):
+                break
+
+            if n_gen > 0 and n_gen % 10 == 0:
+                sys.stdout.write(f"\r[Batch] Generated {n_gen}/{max_new_tokens} tokens...")
+                sys.stdout.flush()
+
+        print()
+        t_wall1 = time.perf_counter()
+        total_s = t_wall1 - t_wall0
+        decode_wall_s = max(0.0, total_s - prefill_s)
+
+        final_outputs = []
+        for b in range(bs):
+            final_outputs.append(outputs[b][max_prompt_len - len(inputs_batch[b]):])
+
+        metrics = {
+            "n_prompt": n_prompt_per_seq,
+            "n_generated": n_gen,
+            "batch_size": bs,
+            "prefill_s": prefill_s,
+            "decode_wall_s": decode_wall_s,
+            "total_s": total_s,
+            "sum_decode_kernel_s": sum_decode_kernel_s,
+        }
+        return final_outputs, metrics
+
     def __del__(self):
         """Cleanup"""
         if hasattr(self, "_model") and self._model:
@@ -573,6 +662,311 @@ class Qwen2TP:
 
         return output_tokens, metrics
 
+    def generate_with_pd_metrics_batch(
+        self,
+        inputs_batch,
+        max_new_tokens: int = None,
+        top_k: int = 1,
+        top_p: float = 0.8,
+        temperature: float = 0.8,
+    ):
+        """Batch generate: inputs_batch is a list of token lists.
+        All sequences are padded to the same length, then decoded in lockstep.
+        Returns (list of output token lists, metrics dict)."""
+        import sys
+        import time
+
+        if max_new_tokens is None:
+            max_new_tokens = 128
+        if top_k != 1:
+            print("Warning: Only greedy sampling (top_k=1) is currently supported")
+
+        bs = len(inputs_batch)
+        max_prompt_len = max(len(p) for p in inputs_batch)
+
+        # Pad all prompts to the same length
+        padded = []
+        for p in inputs_batch:
+            # Left-pad with a dummy token (use first token as pad)
+            pad_token = p[0] if p else 0
+            padded_p = [pad_token] * (max_prompt_len - len(p)) + p
+            padded.append(padded_p)
+
+        # Flatten to [bs * max_prompt_len] for C++ prefill
+        flat_tokens = []
+        for p in padded:
+            flat_tokens.extend(p)
+
+        # Track per-sequence outputs
+        outputs = [list(p) for p in padded]  # real tokens (no pad)
+
+        n_prompt_per_seq = max_prompt_len
+        t_wall0 = time.perf_counter()
+        prefill_s = 0.0
+        sum_decode_kernel_s = 0.0
+
+        n_gen = 0
+
+        for step in range(max_new_tokens):
+            # Build flat token array: [bs * (n_prompt + step)]
+            current_len = n_prompt_per_seq + step
+            token_array = (c_int64 * (bs * current_len))()
+            for b in range(bs):
+                base = b * current_len
+                for i, tok in enumerate(outputs[b]):
+                    token_array[base + i] = tok
+
+            t0 = time.perf_counter()
+            next_arr = (c_int64 * bs)()
+            LIB_LLAISYS.llaisysQwen2TPModelInferBatch(
+                self._model, token_array, bs * current_len, next_arr, bs
+            )
+            dt = time.perf_counter() - t0
+
+            if step == 0:
+                prefill_s = dt / bs  # per-sequence prefill amortized
+            else:
+                sum_decode_kernel_s += dt
+
+            # Append tokens
+            done = [False] * bs
+            for b in range(bs):
+                if next_arr[b] == self._config["eos_token_id"]:
+                    outputs[b].append(int(next_arr[b]))
+                    done[b] = True
+                else:
+                    outputs[b].append(int(next_arr[b]))
+
+            n_gen += 1
+            if all(done):
+                break
+
+            if n_gen > 0 and n_gen % 10 == 0:
+                sys.stdout.write(f"\r[TP Batch] Generated {n_gen}/{max_new_tokens} tokens...")
+                sys.stdout.flush()
+
+        print()
+        t_wall1 = time.perf_counter()
+        total_s = t_wall1 - t_wall0
+        decode_wall_s = max(0.0, total_s - prefill_s)
+
+        # Strip padding from outputs
+        final_outputs = []
+        for b in range(bs):
+            final_outputs.append(outputs[b][max_prompt_len - len(inputs_batch[b]):])
+
+        metrics = {
+            "n_prompt": n_prompt_per_seq,
+            "n_generated": n_gen,
+            "batch_size": bs,
+            "prefill_s": prefill_s,
+            "decode_wall_s": decode_wall_s,
+            "total_s": total_s,
+            "sum_decode_kernel_s": sum_decode_kernel_s,
+        }
+
+        return final_outputs, metrics
+
+    def init_continuous(self, max_slots: int):
+        rc = LIB_LLAISYS.llaisysQwen2TPModelInitContinuous(self._model, max_slots)
+        if rc != 0:
+            raise RuntimeError("llaisysQwen2TPModelInitContinuous failed")
+
+    def prefill_slot(self, slot_id: int, token_ids: Sequence[int]) -> int:
+        token_array = (c_int64 * len(token_ids))(*token_ids)
+        next_token = LIB_LLAISYS.llaisysQwen2TPModelPrefillSlot(
+            self._model, slot_id, token_array, len(token_ids)
+        )
+        if next_token < 0:
+            raise RuntimeError("llaisysQwen2TPModelPrefillSlot failed")
+        return int(next_token)
+
+    def prefill_slots(self, slot_ids: Sequence[int], inputs_batch):
+        if not slot_ids:
+            return []
+        if len(slot_ids) != len(inputs_batch):
+            raise ValueError("slot_ids and inputs_batch must have the same length")
+        prompt_len = len(inputs_batch[0])
+        if prompt_len == 0:
+            raise ValueError("prompt_len must be > 0")
+        flat_tokens = []
+        for tokens in inputs_batch:
+            if len(tokens) != prompt_len:
+                raise ValueError("prefill_slots requires same-length prompts")
+            flat_tokens.extend(tokens)
+        slot_array = (c_size_t * len(slot_ids))(*slot_ids)
+        token_array = (c_int64 * len(flat_tokens))(*flat_tokens)
+        out_array = (c_int64 * len(slot_ids))()
+        rc = LIB_LLAISYS.llaisysQwen2TPModelPrefillSlots(
+            self._model, slot_array, token_array, out_array, len(slot_ids), prompt_len
+        )
+        if rc != 0:
+            raise RuntimeError("llaisysQwen2TPModelPrefillSlots failed")
+        return [int(out_array[i]) for i in range(len(slot_ids))]
+
+    def decode_slots(self, slot_ids: Sequence[int], input_tokens: Sequence[int]):
+        if len(slot_ids) != len(input_tokens):
+            raise ValueError("slot_ids and input_tokens must have the same length")
+        if not slot_ids:
+            return []
+        slot_array = (c_size_t * len(slot_ids))(*slot_ids)
+        token_array = (c_int64 * len(input_tokens))(*input_tokens)
+        out_array = (c_int64 * len(slot_ids))()
+        rc = LIB_LLAISYS.llaisysQwen2TPModelDecodeSlots(
+            self._model, slot_array, token_array, out_array, len(slot_ids)
+        )
+        if rc != 0:
+            raise RuntimeError("llaisysQwen2TPModelDecodeSlots failed")
+        return [int(out_array[i]) for i in range(len(slot_ids))]
+
+    def release_slot(self, slot_id: int):
+        rc = LIB_LLAISYS.llaisysQwen2TPModelReleaseSlot(self._model, slot_id)
+        if rc != 0:
+            raise RuntimeError("llaisysQwen2TPModelReleaseSlot failed")
+
+    def slot_seq_len(self, slot_id: int) -> int:
+        return int(LIB_LLAISYS.llaisysQwen2TPModelSlotSeqLen(self._model, slot_id))
+
     def __del__(self):
         if hasattr(self, "_model") and self._model:
             LIB_LLAISYS.llaisysQwen2TPModelDestroy(self._model)
+
+
+class Qwen2TPContinuousEngine:
+    """Fixed-slot continuous batching helper for online-serving benchmarks."""
+
+    def __init__(self, model: Qwen2TP, max_slots: int, eos_token_id=None, ignore_eos: bool = True):
+        self.model = model
+        self.max_slots = int(max_slots)
+        self.eos_token_id = eos_token_id if eos_token_id is not None else model._config.get("eos_token_id")
+        self.ignore_eos = ignore_eos
+        self.free_slots = list(range(self.max_slots))
+        self.active = {}
+        self.stats = {
+            "prefill_calls": 0,
+            "prefill_batches": 0,
+            "prefill_s": 0.0,
+            "prefill_tokens": 0,
+            "decode_steps": 0,
+            "decode_s": 0.0,
+            "decode_slot_steps": 0,
+        }
+        self.model.init_continuous(self.max_slots)
+
+    def can_accept(self) -> bool:
+        return bool(self.free_slots)
+
+    def submit(self, request_id: int, prompt_tokens: Sequence[int], target_output_len: int, now_s: float):
+        if not self.free_slots:
+            return None
+        import time
+        slot_id = self.free_slots.pop(0)
+        t0 = time.perf_counter()
+        first_token = self.model.prefill_slot(slot_id, prompt_tokens)
+        prefill_dt = time.perf_counter() - t0
+        first_token_s = time.perf_counter()
+        self.stats["prefill_calls"] += 1
+        self.stats["prefill_batches"] += 1
+        self.stats["prefill_s"] += prefill_dt
+        self.stats["prefill_tokens"] += len(prompt_tokens)
+        state = {
+            "request_id": request_id,
+            "slot_id": slot_id,
+            "prompt_len": len(prompt_tokens),
+            "target_output_len": int(target_output_len),
+            "arrival_s": now_s,
+            "first_token_s": first_token_s,
+            "finish_s": None,
+            "output_tokens": [],
+            "last_token": first_token,
+        }
+        state["output_tokens"].append(first_token)
+        self.active[slot_id] = state
+        if self._is_finished(state, first_token):
+            return self._finish_slot(slot_id, first_token_s)
+        return None
+
+    def submit_many_same_len(self, requests, now_s: float):
+        if not requests:
+            return []
+        import time
+        if len(requests) > len(self.free_slots):
+            raise ValueError("not enough free slots for submit_many_same_len")
+        prompt_len = len(requests[0]["prompt_tokens"])
+        for req in requests:
+            if len(req["prompt_tokens"]) != prompt_len:
+                raise ValueError("submit_many_same_len requires same-length prompts")
+
+        slot_ids = [self.free_slots.pop(0) for _ in requests]
+        t0 = time.perf_counter()
+        first_tokens = self.model.prefill_slots(slot_ids, [r["prompt_tokens"] for r in requests])
+        prefill_dt = time.perf_counter() - t0
+        first_token_s = time.perf_counter()
+        completed = []
+        self.stats["prefill_calls"] += 1
+        self.stats["prefill_batches"] += len(requests)
+        self.stats["prefill_s"] += prefill_dt
+        self.stats["prefill_tokens"] += prompt_len * len(requests)
+
+        for slot_id, req, first_token in zip(slot_ids, requests, first_tokens):
+            state = {
+                "request_id": req["request_id"],
+                "slot_id": slot_id,
+                "prompt_len": len(req["prompt_tokens"]),
+                "target_output_len": int(req["output_len"]),
+                "arrival_s": now_s if "arrival_abs_s" not in req else req["arrival_abs_s"],
+                "first_token_s": first_token_s,
+                "finish_s": None,
+                "output_tokens": [first_token],
+                "last_token": first_token,
+            }
+            self.active[slot_id] = state
+            if self._is_finished(state, first_token):
+                completed.append(self._finish_slot(slot_id, first_token_s))
+        return [c for c in completed if c is not None]
+
+    def step(self, now_s: float):
+        if not self.active:
+            return []
+
+        completed = []
+        slot_ids = sorted(self.active)
+        input_tokens = [self.active[s]["last_token"] for s in slot_ids]
+        import time
+        t0 = time.perf_counter()
+        next_tokens = self.model.decode_slots(slot_ids, input_tokens)
+        self.stats["decode_s"] += time.perf_counter() - t0
+        self.stats["decode_steps"] += 1
+        self.stats["decode_slot_steps"] += len(slot_ids)
+        for slot_id, next_token in zip(slot_ids, next_tokens):
+            if slot_id not in self.active:
+                continue
+            state = self.active[slot_id]
+            state["last_token"] = next_token
+            state["output_tokens"].append(next_token)
+            if self._is_finished(state, next_token):
+                completed.append(self._finish_slot(slot_id, now_s))
+        return [c for c in completed if c is not None]
+
+    def active_count(self) -> int:
+        return len(self.active)
+
+    def metrics(self):
+        return dict(self.stats)
+
+    def _is_finished(self, state, token: int) -> bool:
+        if len(state["output_tokens"]) >= state["target_output_len"]:
+            return True
+        if not self.ignore_eos and self.eos_token_id is not None and token == self.eos_token_id:
+            return True
+        return False
+
+    def _finish_slot(self, slot_id: int, now_s: float):
+        state = self.active.pop(slot_id, None)
+        if state is None:
+            return None
+        state["finish_s"] = now_s
+        self.model.release_slot(slot_id)
+        self.free_slots.append(slot_id)
+        self.free_slots.sort()
+        return state

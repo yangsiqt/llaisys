@@ -90,6 +90,16 @@ def load_qwen2(lib):
     ]
     lib.llaisysQwen2ModelInfer.restype = c_int64
 
+    # llaisysQwen2ModelInferBatch
+    lib.llaisysQwen2ModelInferBatch.argtypes = [
+        llaisysQwen2Model_t,
+        POINTER(c_int64),
+        c_size_t,
+        POINTER(c_int64),
+        c_size_t,
+    ]
+    lib.llaisysQwen2ModelInferBatch.restype = c_int
+
     # --- Tensor Parallel API ---
     llaisysQwen2TPModel_t = c_void_p
 
@@ -123,6 +133,59 @@ def load_qwen2(lib):
     ]
     lib.llaisysQwen2TPModelInfer.restype = c_int64
 
+    lib.llaisysQwen2TPModelInferBatch.argtypes = [
+        llaisysQwen2TPModel_t,
+        POINTER(c_int64),
+        c_size_t,
+        POINTER(c_int64),
+        c_size_t,
+    ]
+    lib.llaisysQwen2TPModelInferBatch.restype = c_int
+
+    lib.llaisysQwen2TPModelInitContinuous.argtypes = [
+        llaisysQwen2TPModel_t,
+        c_size_t,
+    ]
+    lib.llaisysQwen2TPModelInitContinuous.restype = c_int
+
+    lib.llaisysQwen2TPModelPrefillSlot.argtypes = [
+        llaisysQwen2TPModel_t,
+        c_size_t,
+        POINTER(c_int64),
+        c_size_t,
+    ]
+    lib.llaisysQwen2TPModelPrefillSlot.restype = c_int64
+
+    lib.llaisysQwen2TPModelPrefillSlots.argtypes = [
+        llaisysQwen2TPModel_t,
+        POINTER(c_size_t),
+        POINTER(c_int64),
+        POINTER(c_int64),
+        c_size_t,
+        c_size_t,
+    ]
+    lib.llaisysQwen2TPModelPrefillSlots.restype = c_int
+
+    lib.llaisysQwen2TPModelDecodeSlots.argtypes = [
+        llaisysQwen2TPModel_t,
+        POINTER(c_size_t),
+        POINTER(c_int64),
+        POINTER(c_int64),
+        c_size_t,
+    ]
+    lib.llaisysQwen2TPModelDecodeSlots.restype = c_int
+
+    lib.llaisysQwen2TPModelReleaseSlot.argtypes = [
+        llaisysQwen2TPModel_t,
+        c_size_t,
+    ]
+    lib.llaisysQwen2TPModelReleaseSlot.restype = c_int
+
+    lib.llaisysQwen2TPModelSlotSeqLen.argtypes = [
+        llaisysQwen2TPModel_t,
+        c_size_t,
+    ]
+    lib.llaisysQwen2TPModelSlotSeqLen.restype = c_size_t
+
     lib.llaisysQwen2TPModelGetTPSize.argtypes = [llaisysQwen2TPModel_t]
     lib.llaisysQwen2TPModelGetTPSize.restype = c_int
-

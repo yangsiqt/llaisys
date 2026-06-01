@@ -15,6 +15,8 @@ option_end()
 
 if has_config("nv-gpu") then
     add_defines("ENABLE_NVIDIA_API")
+    add_includedirs("/usr/local/cuda/include")
+    add_includedirs("/usr/local/cuda/targets/x86_64-linux/include")
     includes("xmake/nvidia.lua")
 end
 

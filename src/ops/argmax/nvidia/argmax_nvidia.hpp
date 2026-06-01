@@ -5,4 +5,6 @@
 namespace llaisys::ops::nvidia {
 void argmax(std::byte *max_idx, std::byte *max_val, const std::byte *vals,
             llaisysDataType_t type, size_t size);
+void argmax_batch(std::byte *max_idx, std::byte *max_val, const std::byte *vals,
+                  llaisysDataType_t type, size_t batch_size, size_t width);
 }

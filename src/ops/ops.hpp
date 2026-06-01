@@ -7,6 +7,7 @@
 #include "argmax/op.hpp"
 #include "embedding/op.hpp"
 #include "linear/op.hpp"
+#include "kv_cache/op.hpp"
 #include "rearrange/op.hpp"
 #include "rms_norm/op.hpp"
 #include "rope/op.hpp"
@@ -14,4 +15,3 @@
 #include "swiglu/op.hpp"
 
 #endif // LLAISYS_OPS_HPP
-

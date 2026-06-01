@@ -57,6 +57,13 @@ __C {
     __export void llaisysQwen2TPModelSetLayerWeight(struct LlaisysQwen2TPModel *model, int rank, const char *name, size_t layer_idx, llaisysTensor_t tensor);
 
     __export int64_t llaisysQwen2TPModelInfer(struct LlaisysQwen2TPModel *model, int64_t *token_ids, size_t ntoken);
+    __export int llaisysQwen2TPModelInferBatch(struct LlaisysQwen2TPModel *model, int64_t *token_ids, size_t ntoken, int64_t *out, size_t batch_size);
+    __export int llaisysQwen2TPModelInitContinuous(struct LlaisysQwen2TPModel *model, size_t max_slots);
+    __export int64_t llaisysQwen2TPModelPrefillSlot(struct LlaisysQwen2TPModel *model, size_t slot_id, int64_t *token_ids, size_t ntoken);
+    __export int llaisysQwen2TPModelPrefillSlots(struct LlaisysQwen2TPModel *model, size_t *slot_ids, int64_t *token_ids, int64_t *out, size_t nslot, size_t prompt_len);
+    __export int llaisysQwen2TPModelDecodeSlots(struct LlaisysQwen2TPModel *model, size_t *slot_ids, int64_t *input_tokens, int64_t *out, size_t nslot);
+    __export int llaisysQwen2TPModelReleaseSlot(struct LlaisysQwen2TPModel *model, size_t slot_id);
+    __export size_t llaisysQwen2TPModelSlotSeqLen(struct LlaisysQwen2TPModel *model, size_t slot_id);
     __export int llaisysQwen2TPModelGetTPSize(struct LlaisysQwen2TPModel *model);
 }
 #endif // LLAISYS_MODELS_QWEN2_H
