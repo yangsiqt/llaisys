@@ -310,6 +310,19 @@ int llaisysQwen2TPModelPrefillSlots(struct LlaisysQwen2TPModel *model, size_t *s
     return 0;
 }
 
+int llaisysQwen2TPModelPrefillSlotsVarlen(struct LlaisysQwen2TPModel *model, size_t *slot_ids,
+                                          int64_t *token_ids, size_t *prompt_lens, int64_t *out,
+                                          size_t nslot, size_t max_prompt_len) {
+    if (!model || !model->model || !slot_ids || !token_ids || !prompt_lens || !out ||
+        nslot == 0 || max_prompt_len == 0) return -1;
+    std::vector<size_t> slots(slot_ids, slot_ids + nslot);
+    std::vector<size_t> lens(prompt_lens, prompt_lens + nslot);
+    std::vector<int64_t> tokens(token_ids, token_ids + nslot * max_prompt_len);
+    auto result = model->model->prefill_slots_varlen(slots, tokens, lens, max_prompt_len);
+    for (size_t i = 0; i < result.size(); i++) out[i] = result[i];
+    return 0;
+}
+
 int llaisysQwen2TPModelDecodeSlots(struct LlaisysQwen2TPModel *model, size_t *slot_ids,
                                    int64_t *input_tokens, int64_t *out, size_t nslot) {
     if (!model || !model->model || !slot_ids || !input_tokens || !out || nslot == 0) return -1;

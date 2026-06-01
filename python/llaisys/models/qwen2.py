@@ -833,6 +833,37 @@ class Qwen2TP:
             raise RuntimeError("llaisysQwen2TPModelPrefillSlots failed")
         return [int(out_array[i]) for i in range(len(slot_ids))]
 
+    def prefill_slots_varlen(self, slot_ids: Sequence[int], inputs_batch):
+        if not slot_ids:
+            return []
+        if len(slot_ids) != len(inputs_batch):
+            raise ValueError("slot_ids and inputs_batch must have the same length")
+        prompt_lens = [len(tokens) for tokens in inputs_batch]
+        if any(n <= 0 for n in prompt_lens):
+            raise ValueError("all prompts must be non-empty")
+        max_prompt_len = max(prompt_lens)
+        flat_tokens = []
+        for tokens in inputs_batch:
+            pad_token = int(tokens[-1])
+            flat_tokens.extend(tokens)
+            flat_tokens.extend([pad_token] * (max_prompt_len - len(tokens)))
+        slot_array = (c_size_t * len(slot_ids))(*slot_ids)
+        token_array = (c_int64 * len(flat_tokens))(*flat_tokens)
+        len_array = (c_size_t * len(prompt_lens))(*prompt_lens)
+        out_array = (c_int64 * len(slot_ids))()
+        rc = LIB_LLAISYS.llaisysQwen2TPModelPrefillSlotsVarlen(
+            self._model,
+            slot_array,
+            token_array,
+            len_array,
+            out_array,
+            len(slot_ids),
+            max_prompt_len,
+        )
+        if rc != 0:
+            raise RuntimeError("llaisysQwen2TPModelPrefillSlotsVarlen failed")
+        return [int(out_array[i]) for i in range(len(slot_ids))]
+
     def decode_slots(self, slot_ids: Sequence[int], input_tokens: Sequence[int]):
         if len(slot_ids) != len(input_tokens):
             raise ValueError("slot_ids and input_tokens must have the same length")
@@ -895,6 +926,7 @@ class Qwen2TPContinuousEngine:
         self.model = model
         self.max_slots = int(max_slots)
         self.kv_mode = kv_mode
+        self.paged_prefill_scratch_slots = int(paged_prefill_scratch_slots)
         self.eos_token_id = eos_token_id if eos_token_id is not None else model._config.get("eos_token_id")
         self.ignore_eos = ignore_eos
         self.free_slots = list(range(self.max_slots))
@@ -998,9 +1030,46 @@ class Qwen2TPContinuousEngine:
                 completed.append(self._finish_slot(slot_id, first_token_s))
         return [c for c in completed if c is not None]
 
+    def submit_many_varlen(self, requests, now_s: float):
+        if not requests:
+            return []
+        if self.kv_mode != "paged":
+            return self.submit_many_same_len(requests, now_s)
+        import time
+        if len(requests) > len(self.free_slots):
+            raise ValueError("not enough free slots for submit_many_varlen")
+        if len(requests) > self.paged_prefill_scratch_slots:
+            raise ValueError("batch exceeds paged prefill scratch slots")
+
+        slot_ids = [self.free_slots.pop(0) for _ in requests]
+        t0 = time.perf_counter()
+        first_tokens = self.model.prefill_slots_varlen(slot_ids, [r["prompt_tokens"] for r in requests])
+        prefill_dt = time.perf_counter() - t0
+        first_token_s = time.perf_counter()
+        completed = []
+        self.stats["prefill_calls"] += 1
+        self.stats["prefill_batches"] += len(requests)
+        self.stats["prefill_s"] += prefill_dt
+        self.stats["prefill_tokens"] += sum(len(r["prompt_tokens"]) for r in requests)
+
+        for slot_id, req, first_token in zip(slot_ids, requests, first_tokens):
+            state = {
+                "request_id": req["request_id"],
+                "slot_id": slot_id,
+                "prompt_len": len(req["prompt_tokens"]),
+                "target_output_len": int(req["output_len"]),
+                "arrival_s": now_s if "arrival_abs_s" not in req else req["arrival_abs_s"],
+                "first_token_s": first_token_s,
+                "finish_s": None,
+                "output_tokens": [first_token],
+                "last_token": first_token,
+            }
+            self.active[slot_id] = state
+            if self._is_finished(state, first_token):
+                completed.append(self._finish_slot(slot_id, first_token_s))
+        return [c for c in completed if c is not None]
+
     def start_prefill_chunked(self, request, chunk_tokens: int, now_s: float):
-        if self.kv_mode == "paged":
-            raise ValueError("chunked prefill is not supported with kv_mode=paged in the MVP")
         if not self.free_slots:
             return [], 0
         slot_id = self.free_slots.pop(0)

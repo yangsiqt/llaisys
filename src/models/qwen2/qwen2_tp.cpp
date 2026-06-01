@@ -389,12 +389,15 @@ int64_t Qwen2TPModel::prefill_slot_chunk(size_t slot_id, const std::vector<int64
     CHECK_ARGUMENT(slot_seq_lens_[slot_id] + token_ids.size() <= config_.maxseq,
                    "prefill_slot_chunk: sequence length exceeds maxseq");
 
-    CHECK_ARGUMENT(!paged_kv_mode_, "prefill_slot_chunk: paged KV does not support chunked prefill in MVP");
     size_t start_pos = slot_seq_lens_[slot_id];
-    std::vector<size_t> slot_ids{slot_id};
+    if (paged_kv_mode_ && start_pos == 0) {
+        release_paged_blocks(slot_id);
+        slot_active_[slot_id] = 0;
+    }
+    size_t scratch_slot_id = paged_kv_mode_ ? 0 : slot_id;
+    std::vector<size_t> slot_ids{scratch_slot_id};
     tensor_t logits = forward_slots(token_ids, slot_ids, start_pos, token_ids.size());
 
-    slot_active_[slot_id] = 1;
     slot_seq_lens_[slot_id] += token_ids.size();
 
     if (!final_chunk) {
@@ -413,7 +416,12 @@ int64_t Qwen2TPModel::prefill_slot_chunk(size_t slot_id, const std::vector<int64
     core::context().runtime().api()->memcpy_sync(
         buffer.data(), max_idx->data(), sizeof(int64_t), LLAISYS_MEMCPY_D2H);
     std::memcpy(&next_token, buffer.data(), sizeof(int64_t));
+    slot_active_[slot_id] = 1;
     slot_last_tokens_[slot_id] = next_token;
+    if (paged_kv_mode_) {
+        allocate_paged_blocks_for_len(slot_id, slot_seq_lens_[slot_id]);
+        copy_prefill_to_paged_cache({slot_id}, {scratch_slot_id}, slot_seq_lens_[slot_id]);
+    }
     return next_token;
 }
 
@@ -466,6 +474,57 @@ std::vector<int64_t> Qwen2TPModel::prefill_slots(const std::vector<size_t>& slot
             allocate_paged_blocks_for_len(slot_id, prompt_len);
         }
         copy_prefill_to_paged_cache(slot_ids, forward_slot_ids, prompt_len);
+    }
+    return next_tokens;
+}
+
+std::vector<int64_t> Qwen2TPModel::prefill_slots_varlen(const std::vector<size_t>& slot_ids,
+                                                        const std::vector<int64_t>& token_ids,
+                                                        const std::vector<size_t>& prompt_lens,
+                                                        size_t max_prompt_len) {
+    CHECK_ARGUMENT(continuous_ready_, "prefill_slots_varlen: init_continuous must be called first");
+    CHECK_ARGUMENT(paged_kv_mode_, "prefill_slots_varlen: paged KV only");
+    CHECK_ARGUMENT(!slot_ids.empty(), "prefill_slots_varlen: slot_ids must not be empty");
+    CHECK_ARGUMENT(slot_ids.size() == prompt_lens.size(), "prefill_slots_varlen: prompt_lens mismatch");
+    CHECK_ARGUMENT(max_prompt_len > 0 && max_prompt_len <= config_.maxseq,
+                   "prefill_slots_varlen: invalid max_prompt_len");
+    CHECK_ARGUMENT(token_ids.size() == slot_ids.size() * max_prompt_len,
+                   "prefill_slots_varlen: token count mismatch");
+    CHECK_ARGUMENT(slot_ids.size() <= prefill_scratch_slots_,
+                   "prefill_slots_varlen: batch exceeds paged scratch slots");
+
+    std::vector<size_t> scratch_slot_ids(slot_ids.size());
+    for (size_t i = 0; i < slot_ids.size(); i++) {
+        CHECK_ARGUMENT(slot_ids[i] < max_slots_, "prefill_slots_varlen: invalid slot_id");
+        CHECK_ARGUMENT(prompt_lens[i] > 0 && prompt_lens[i] <= max_prompt_len,
+                       "prefill_slots_varlen: invalid prompt length");
+        scratch_slot_ids[i] = i;
+    }
+
+    tensor_t logits = forward_slots(token_ids, scratch_slot_ids, 0, max_prompt_len);
+
+    int dev_id = device_ids_[0];
+    core::context().setDevice(device_type_, dev_id);
+    std::vector<int64_t> next_tokens(slot_ids.size());
+    for (size_t b = 0; b < slot_ids.size(); b++) {
+        size_t last_idx = b * max_prompt_len + prompt_lens[b] - 1;
+        tensor_t last_logits = logits->slice(0, last_idx, last_idx + 1);
+        tensor_t max_idx = Tensor::create({1}, LLAISYS_DTYPE_I64, device_type_, dev_id);
+        tensor_t max_val = Tensor::create({1}, config_.dtype, device_type_, dev_id);
+        ops::argmax(max_idx, max_val, last_logits->view({config_.voc}));
+
+        std::vector<std::byte> buffer(sizeof(int64_t));
+        core::context().runtime().api()->memcpy_sync(
+            buffer.data(), max_idx->data(), sizeof(int64_t), LLAISYS_MEMCPY_D2H);
+        std::memcpy(&next_tokens[b], buffer.data(), sizeof(int64_t));
+
+        size_t slot_id = slot_ids[b];
+        release_paged_blocks(slot_id);
+        allocate_paged_blocks_for_len(slot_id, prompt_lens[b]);
+        copy_prefill_to_paged_cache({slot_id}, {scratch_slot_ids[b]}, prompt_lens[b]);
+        slot_active_[slot_id] = 1;
+        slot_seq_lens_[slot_id] = prompt_lens[b];
+        slot_last_tokens_[slot_id] = next_tokens[b];
     }
     return next_tokens;
 }

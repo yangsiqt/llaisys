@@ -51,6 +51,10 @@ public:
     std::vector<int64_t> prefill_slots(const std::vector<size_t>& slot_ids,
                                        const std::vector<int64_t>& token_ids,
                                        size_t prompt_len);
+    std::vector<int64_t> prefill_slots_varlen(const std::vector<size_t>& slot_ids,
+                                              const std::vector<int64_t>& token_ids,
+                                              const std::vector<size_t>& prompt_lens,
+                                              size_t max_prompt_len);
     std::vector<int64_t> decode_slots(const std::vector<size_t>& slot_ids,
                                       const std::vector<int64_t>& input_tokens);
     void release_slot(size_t slot_id);

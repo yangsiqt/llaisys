@@ -184,6 +184,62 @@ def choose_prefill_len(waiting, prefill_bucket_size):
     return max(counts.items(), key=lambda item: (item[1], -abs(item[0] - first_len)))[0]
 
 
+def running_count(engine):
+    return engine.active_count() + engine.prefilling_count()
+
+
+def running_room(engine, max_running):
+    if max_running <= 0:
+        return len(engine.free_slots)
+    return max(0, min(len(engine.free_slots), max_running - running_count(engine)))
+
+
+def pick_paged_varlen_batch(waiting, free_room, max_prefill_batch, scratch_slots,
+                            bucket_size, max_padded_tokens):
+    if not waiting or free_room <= 0:
+        return [], waiting, 0
+    limit = min(free_room, max_prefill_batch, scratch_slots)
+    if limit <= 0:
+        return [], waiting, 0
+
+    if bucket_size > 0:
+        buckets = Counter(req["prompt_len"] // bucket_size for req in waiting)
+        bucket_id = max(buckets.items(), key=lambda item: (item[1], -item[0]))[0]
+        candidates = [req for req in waiting if req["prompt_len"] // bucket_size == bucket_id]
+    else:
+        candidates = list(waiting)
+    candidates = sorted(candidates, key=lambda req: req["prompt_len"])
+
+    best = []
+    best_score = None
+    for start in range(len(candidates)):
+        batch = []
+        max_len = 0
+        for req in candidates[start:]:
+            if len(batch) >= limit:
+                break
+            max_len = max(max_len, req["prompt_len"])
+            padded_tokens = max_len * (len(batch) + 1)
+            if max_padded_tokens > 0 and padded_tokens > max_padded_tokens and batch:
+                break
+            batch.append(req)
+        if not batch:
+            continue
+        padded_tokens = max(req["prompt_len"] for req in batch) * len(batch)
+        real_tokens = sum(req["prompt_len"] for req in batch)
+        score = (len(batch), real_tokens / max(1, padded_tokens), -padded_tokens)
+        if best_score is None or score > best_score:
+            best_score = score
+            best = batch
+
+    if not best:
+        best = [min(waiting, key=lambda req: req["prompt_len"])]
+    chosen_ids = {id(req) for req in best}
+    keep = [req for req in waiting if id(req) not in chosen_ids]
+    padded_tokens = max(req["prompt_len"] for req in best) * len(best)
+    return best, keep, padded_tokens
+
+
 def run_one(model, args, arrival_rate, device_ids):
     rate_seed = 1000000 if arrival_rate == float("inf") else int(arrival_rate * 1000)
     rng = random.Random(args.seed + rate_seed)
@@ -246,8 +302,12 @@ def run_one(model, args, arrival_rate, device_ids):
                 completed.extend(done)
                 prefill_budget -= used_tokens
 
-            while waiting and engine.can_accept():
+            while waiting and engine.can_accept() and running_room(engine, args.max_running) > 0:
                 if args.chunked_prefill_tokens > 0:
+                    if args.kv_mode == "paged" and engine.prefilling_count() > 0:
+                        break
+                    if args.max_running > 0 and running_count(engine) >= args.max_running:
+                        break
                     if prefill_budget <= 0:
                         break
                     req = waiting.pop(0)
@@ -262,14 +322,28 @@ def run_one(model, args, arrival_rate, device_ids):
                     free_slots = len(engine.free_slots)
                     if oldest_wait_s * 1000.0 < args.prefill_wait_ms and len(waiting) < free_slots:
                         break
-                free_slots = len(engine.free_slots)
+                free_slots = running_room(engine, args.max_running)
+                if free_slots <= 0:
+                    break
+                max_prefill_batch = args.max_prefill_batch if args.max_prefill_batch > 0 else free_slots
+                if args.kv_mode == "paged":
+                    batch, waiting, used_prefill_tokens = pick_paged_varlen_batch(
+                        waiting,
+                        free_slots,
+                        max_prefill_batch,
+                        args.paged_prefill_scratch_slots,
+                        args.prefill_bucket_size,
+                        args.max_prefill_padded_tokens,
+                    )
+                    if not batch:
+                        break
+                    completed.extend(engine.submit_many_varlen(batch, time.perf_counter()))
+                    continue
+
                 first_len = choose_prefill_len(waiting, args.prefill_bucket_size)
                 batch = []
                 keep = []
                 used_prefill_tokens = 0
-                max_prefill_batch = args.max_prefill_batch if args.max_prefill_batch > 0 else free_slots
-                if args.kv_mode == "paged":
-                    max_prefill_batch = min(max_prefill_batch, args.paged_prefill_scratch_slots)
                 for req in waiting:
                     same_len = req["prompt_len"] == first_len
                     under_batch = len(batch) < min(free_slots, max_prefill_batch)
@@ -304,9 +378,13 @@ def run_one(model, args, arrival_rate, device_ids):
                         break
 
             if engine.active_count() > 0:
-                completed.extend(engine.step(time.perf_counter(), max_batch=args.max_active_decode))
-                active_samples.append(engine.active_count())
-                waiting_samples.append(len(waiting))
+                decode_steps_this_loop = max(1, args.decode_steps_per_loop)
+                for _ in range(decode_steps_this_loop):
+                    if engine.active_count() <= 0:
+                        break
+                    completed.extend(engine.step(time.perf_counter(), max_batch=args.max_active_decode))
+                    active_samples.append(engine.active_count())
+                    waiting_samples.append(len(waiting))
             elif req_idx < len(requests):
                 sleep_s = max(0.0, start + requests[req_idx]["arrival_s"] - time.perf_counter())
                 time.sleep(min(sleep_s, 0.001))
@@ -400,9 +478,12 @@ def run_one(model, args, arrival_rate, device_ids):
         "decode_step_ms": decode_step_s * 1000.0,
         "decode_slot_step_ms": decode_slot_step_s * 1000.0,
         "max_active_decode": args.max_active_decode,
+        "max_running": args.max_running,
+        "decode_steps_per_loop": args.decode_steps_per_loop,
         "max_prefill_batch": args.max_prefill_batch,
         "chunked_prefill_tokens": args.chunked_prefill_tokens,
         "prefill_bucket_size": args.prefill_bucket_size,
+        "max_prefill_padded_tokens": args.max_prefill_padded_tokens,
     }
     row.update(
         {
@@ -463,8 +544,11 @@ def main():
     parser.add_argument("--num_requests", default=0, type=int)
     parser.add_argument("--arrival_pattern", default="fixed", choices=["fixed", "poisson"])
     parser.add_argument("--max_active_decode", default=0, type=int)
+    parser.add_argument("--max_running", default=0, type=int)
+    parser.add_argument("--decode_steps_per_loop", default=1, type=int)
     parser.add_argument("--prefill_bucket_size", default=0, type=int)
     parser.add_argument("--max_prefill_batch", default=0, type=int)
+    parser.add_argument("--max_prefill_padded_tokens", default=0, type=int)
     parser.add_argument("--chunked_prefill_tokens", default=0, type=int)
     parser.add_argument("--progress_interval", default=10.0, type=float)
     parser.add_argument(
@@ -484,8 +568,6 @@ def main():
             raise ValueError("kv_mode=paged is TP=1 only in the MVP")
         if args.paged_max_blocks <= 0:
             raise ValueError("--paged_max_blocks must be > 0 when --kv_mode paged")
-        if args.chunked_prefill_tokens > 0:
-            raise ValueError("--chunked_prefill_tokens is not supported with --kv_mode paged in the MVP")
     if not args.csv:
         DEFAULT_RESULT_DIR.mkdir(parents=True, exist_ok=True)
         args.csv = str(DEFAULT_RESULT_DIR / "bench_online_cb.csv")
@@ -544,9 +626,12 @@ def main():
         "decode_step_ms",
         "decode_slot_step_ms",
         "max_active_decode",
+        "max_running",
+        "decode_steps_per_loop",
         "max_prefill_batch",
         "chunked_prefill_tokens",
         "prefill_bucket_size",
+        "max_prefill_padded_tokens",
         "block_size",
         "max_blocks",
         "used_blocks",

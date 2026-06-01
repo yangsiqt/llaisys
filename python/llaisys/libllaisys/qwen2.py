@@ -197,6 +197,17 @@ def load_qwen2(lib):
     ]
     lib.llaisysQwen2TPModelPrefillSlots.restype = c_int
 
+    lib.llaisysQwen2TPModelPrefillSlotsVarlen.argtypes = [
+        llaisysQwen2TPModel_t,
+        POINTER(c_size_t),
+        POINTER(c_int64),
+        POINTER(c_size_t),
+        POINTER(c_int64),
+        c_size_t,
+        c_size_t,
+    ]
+    lib.llaisysQwen2TPModelPrefillSlotsVarlen.restype = c_int
+
     lib.llaisysQwen2TPModelDecodeSlots.argtypes = [
         llaisysQwen2TPModel_t,
         POINTER(c_size_t),
