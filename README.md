@@ -1,179 +1,325 @@
-# LLM 推理系统：张量 → 算子 → 端到端 →CPU/GPU/分布式
+# LLAISYS：面向大模型 Serving 的 C++/CUDA 推理系统
 
-本仓库用 **多个 Git 分支** 分别承载 **CPU 优化**、**单卡 GPU（CUTLASS + cuBLAS）** 与 **双卡张量并行（NCCL TP）**；编译与入口脚本相同，但 **请先 `git checkout` 到对应分支** 再构建，避免与代码不一致。本工程使用Python 负责编排与 HF 生态对接，经 C 接口调用 C++/CUDA；算子与推理下沉原生层，兼顾迭代效率与算力。
+LLAISYS 是一个面向大模型推理系统的 C++/CUDA 项目，覆盖 Qwen2 端到端推理、CUDA 算子、TP 张量并行、Continuous Batching、Paged KV Cache 与 online serving benchmark。
 
----
-
-## 1. 概述
-
-### 1.1 分支功能
-
-| 分支 | 侧重点 | 典型场景 |
-|------|--------|----------|
-| **`feature/cpu`** | **OpenBLAS** + **OpenMP** + **AVX-512** 等 CPU 编译与 `linear` 等算子优化（`LLAISYS_USE_OPENBLAS` 等，见 `xmake/cpu.lua`） | 1.5B **纯 CPU** 端到端、`test/dzy_test_infer.py --device cpu` |
-| **`perf/cutlass`** | 引入 **`third_party/cutlass`** 头文件，NVIDIA `linear` 等与 **cuBLAS / CUTLASS** 对齐的单卡 GPU 路径；`xmake/nvidia.lua` 以 **sm_86** 等为主（适合 **RTX 3090** 一类） | 1.5B **单卡 GPU**、`dzy_test_infer.py --device nvidia` |
-| **`feature/tp`** | 在 GPU 算子线路上叠加 **NCCL**、**Megatron 式张量并行**、`Qwen2TP`、`test/tp_infer.py`；`xmake/nvidia.lua` 含 **NCCL** 与多架构（如 **sm_80、sm_86**，便于 **A800** 等） | **DeepSeek-R1-Distill-Qwen-14B**、**TP=2** 双卡 |
-
-### 1.2 核心代码
-
-| 内容 | 位置 |
-|------|------|
-| C API / 模型 | `include/llaisys/`，`src/llaisys/`，`src/models/` 等 |
-| Python 封装 | `python/llaisys/`（`Qwen2`；**`Qwen2TP` 在 `feature/tp`**） |
-| 1.5B 端到端（CPU 或单卡 GPU） | `test/dzy_test_infer.py` |
-| 14B 双卡 TP | **`feature/tp`**：`test/tp_infer.py` |
-| 构建 | `xmake.lua`，`xmake/cpu.lua`，`xmake/nvidia.lua` |
+项目采用 Python 负责模型加载、权重切分与请求调度，通过 C API 调用 C++/CUDA 后端执行推理。整体链路从张量、算子、KV cache、batch scheduler 到 TP 通信逐层下沉，重点验证 GPU serving 场景中的吞吐、延迟、显存与通信开销。
 
 ---
 
-## 2. 环境安装与配置
+## 核心特性
 
-### 2.1 通用依赖
+- **C++/CUDA 推理后端**：实现 Qwen2 系列模型的端到端推理链路，支持 FP32 / FP16 / BF16。
+- **Python 前端 + C API**：使用 Python 对接 HuggingFace / Safetensors 生态，通过 ctypes 调用 C++ 后端。
+- **CUDA 算子路径**：实现 Embedding、Linear、RMSNorm、RoPE、Self-Attention、SwiGLU 等算子。
+- **cuBLAS / CUTLASS Linear**：针对 GPU Linear 路径适配 cuBLAS，并在 BF16 / FP16 对齐场景下支持 CUTLASS 路径。
+- **TP=2 张量并行**：采用 Megatron-style QKV/O-Proj 与 SwiGLU-MLP 列/行并行，每层通过 NCCL AllReduce 聚合。
+- **Continuous Batching**：为每个请求维护独立 slot，scheduler 每轮动态组成 active batch 进行 decode。
+- **Paged KV Cache / Block Manager**：按 token block 动态分配 KV cache，支持 block table、block 释放复用与 utilization 统计。
+- **Serving 优化路径**：实现 prefill workspace、paged decode attention、chunked prefill + decode interleave、CUDA Graph fallback、NCCL async allreduce 等实验与 A/B 路径。
+- **Online Serving Benchmark**：统计 output tok/s、TTFT、TPOT、p99 latency、峰值显存、active batch、waiting queue 与 KV block 使用情况。
 
-- **系统**：Ubuntu 22.04  
-- **构建**：[Xmake](https://xmake.io/)  
-- **编译器**：GCC 或 Clang（C++17）  
-- **Python**：3.12.3（conda base 实测）  
-- **Python 包**：`torch` 2.8.0+cu128，`transformers` 5.2.0，`huggingface_hub` 1.5.0，`safetensors` 0.7.0  
-- **CUDA**：12.8（与上述 `torch` wheel 一致）
+---
 
-### 2.2 CPU 路径（`feature/cpu`）
+## 性能概览
 
-- 安装 **OpenBLAS**，并保证链接期能找到库；`feature/cpu` 下 `xmake/cpu.lua` 默认示例为 Ubuntu 常见路径（`/usr/lib/x86_64-linux-gnu` 等），若路径不同需自行改 `xmake/cpu.lua` 或做软链接。  
-- 运行时用 **`OMP_NUM_THREADS`**、**`OPENBLAS_NUM_THREADS`** 与机器核心数对齐。
+测试环境：
 
-### 2.3 GPU 路径（`perf/cutlass` / `feature/tp`）
 
-- **CUDA Toolkit**、驱动；**CUTLASS**：在含 `third_party/cutlass` 的分支上，首次克隆后需拉取子模块（见第 3 节）。  
-- **NCCL（仅 `feature/tp`）**：需开发头文件与动态库；若使用 PyPI 的 **`nvidia-nccl-cu12`** 等 wheel，运行时常需将 **`…/site-packages/nvidia/nccl/lib`** 加入 **`LD_LIBRARY_PATH`**。  
-- `feature/tp` 的 `xmake/nvidia.lua` 会尝试探测 conda 下 `nvidia/nccl`，否则回退 **`/usr/include`** 与 **`/usr/lib/x86_64-linux-gnu`**，请与机器实际安装一致。
+| 项目  | 配置                                         |
+| --- | ------------------------------------------ |
+| 模型  | DeepSeek-R1-Distill-Qwen-14B               |
+| 精度  | BF16                                       |
+| GPU | 2 x A800 80GB                              |
+| 场景  | p128d128 controlled serving                |
+| 输入  | 真实 ShareGPT prompt token-id，截断到 128 tokens |
+| 输出  | 固定生成 128 tokens，`ignore_eos=true`          |
+| 请求  | 32 requests，arrival=inf，max concurrency=32 |
 
-### 2.4 模型下载（可选镜像）
 
-```bash
-mkdir -p /path/to/models
-export HF_ENDPOINT=https://hf-mirror.com
-python -c "
-from huggingface_hub import snapshot_download
-snapshot_download(
-    'deepseek-ai/DeepSeek-R1-Distill-Qwen-14B',
-    local_dir='/path/to/models/DeepSeek-R1-Distill-Qwen-14B',
-    resume_download=True,
-)
-"
+LLAISYS p128d128 controlled serving 最优性能：
+
+
+| 系统      | 配置                              | Output tok/s | Total tok/s | 平均 TTFT | 平均 TPOT | P99 latency | 峰值显存      |
+| ------- | ------------------------------- | ------------ | ----------- | ------- | ------- | ----------- | --------- |
+| LLAISYS | TP=2 Paged KV + Paged Attention | 653          | 1306        | 1166 ms | 39.3 ms | 6154 ms     | 23349 MiB |
+
+
+---
+
+## 技术架构
+
+```text
+Python frontend
+  ├── HuggingFace tokenizer / config
+  ├── Safetensors weight loading
+  ├── TP rank weight slicing
+  ├── Continuous batching scheduler
+  └── ctypes C API
+
+C API
+  ├── Qwen2 / Qwen2TP model lifecycle
+  ├── init continuous / paged continuous
+  ├── prefill / decode slots
+  └── benchmark-facing stats
+
+C++ / CUDA backend
+  ├── Tensor / Storage / Device runtime
+  ├── CUDA ops
+  ├── Qwen2 end-to-end forward
+  ├── TP=2 NCCL communication
+  ├── Fixed-slot KV cache
+  └── Paged KV cache + block manager
 ```
 
-1.5B模型 将 repo id 换为 `deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B` 即可。
+关键目录：
+
+
+| 内容               | 路径                                |
+| ---------------- | --------------------------------- |
+| C API            | `include/llaisys/`，`src/llaisys/` |
+| Qwen2 / Qwen2TP  | `src/models/qwen2/`               |
+| CUDA 算子          | `src/ops/`                        |
+| Python 封装        | `python/llaisys/`                 |
+| Online benchmark | `test/bench_online_cb.py`         |
+| TP 推理入口          | `test/tp_infer.py`                |
+| 构建配置             | `xmake.lua`，`xmake/nvidia.lua`    |
+
 
 ---
 
-## 3. 编译与安装
+## 环境依赖
 
-**务必先切换到目标分支**，再在仓库根目录执行。
+推荐环境：
 
-### 3.1 开启 CUDA（`perf/cutlass` 或 `feature/tp`）
+- Ubuntu 22.04
+- NVIDIA Driver + CUDA Toolkit 12.x
+- NCCL
+- Xmake
+- Python 3.12
+- PyTorch CUDA wheel
+- `transformers`
+- `safetensors`
+- `huggingface_hub`
+
+如果 NCCL 来自 PyPI wheel，例如 `nvidia-nccl-cu12`，运行时可能需要设置：
+
+```bash
+export LD_LIBRARY_PATH=/root/miniconda3/lib/python3.12/site-packages/nvidia/nccl/lib:$LD_LIBRARY_PATH
+```
+
+---
+
+## 编译安装
 
 ```bash
 cd /path/to/llaisys
-git checkout perf/cutlass   # 或: git checkout feature/tp
+
 xmake f --nv-gpu=y -cv --root
 xmake --root
 xmake install --root
-pip install ./python/
-```
 
-### 3.2 仅 CPU（`feature/cpu`）
-
-```bash
-cd /path/to/llaisys
-git checkout feature/cpu
-xmake f -c
-xmake f --nv-gpu=n
-xmake --root
-xmake install --root
 pip install ./python/
 ```
 
 ---
 
-## 4. 运行
+## 快速开始
 
-### 4.1 CPU：DeepSeek-R1-Distill-Qwen-1.5B（`feature/cpu`）
-
-`--test` 下脚本会将采样设为确定性配置（见 `test/dzy_test_infer.py`）。
+### TP=2 分布式推理
 
 ```bash
-git checkout feature/cpu
-# … 按 3.2 节完成仅 CPU 构建与 pip install …
-
-cd /path/to/llaisys
-python test/dzy_test_infer.py --model /path/to/DeepSeek-R1-Distill-Qwen-1.5B/ --test --device cpu
-```
-
-### 4.2 单卡 GPU（RTX 3090 等）：同一 1.5B 脚本（`perf/cutlass` 或 `feature/tp`）
-
-使用 CUDA 构建后，指定 **`--device nvidia`**（模型路径按本机修改，下例为相对目录）：
-
-```bash
-git checkout perf/cutlass   # 或 feature/tp（单卡可不跑 TP，仅跑 Qwen2）
-# … 按 3.1 节完成 CUDA 构建与 pip install …
-
-cd /path/to/llaisys
-python test/dzy_test_infer.py --model models/DeepSeek-R1-Distill-Qwen-1.5B/ --test --device nvidia
-```
-
-### 4.3 双卡张量并行：14B + `test/tp_infer.py`（**仅 `feature/tp`**）
-
-环境示例：**2×A800 NVLink**，模型 **DeepSeek-R1-Distill-Qwen-14B**，**TP=2**。需保证运行时能加载 **NCCL**：
-
-```bash
-git checkout feature/tp
-# … 按 3.1 节完成 CUDA + NCCL 构建与 pip install …
-
-cd /home/dzy/za/llaisys
-export LD_LIBRARY_PATH=/root/miniconda3/lib/python3.12/site-packages/nvidia/nccl/lib:$LD_LIBRARY_PATH
 python test/tp_infer.py \
   --model /root/autodl-tmp/models/DeepSeek-R1-Distill-Qwen-14B \
   --test \
   --device_ids 0,1
 ```
 
-常用参数见 `test/tp_infer.py`：`--prompt`、`--max_steps`、`--device_ids`。脚本会输出 **prefill / decode 速度、**decode（仅内核累计）** 及 **nvidia-smi 轮询峰值显存**。
+### Continuous Batching / Paged KV Benchmark
+
+```bash
+LLAISYS_PAGED_ATTN_V2=1 python test/bench_online_cb.py \
+  --model /root/autodl-tmp/models/DeepSeek-R1-Distill-Qwen-14B \
+  --device_ids 0,1 \
+  --kv_mode paged \
+  --paged_block_size 16 \
+  --paged_max_blocks 4096 \
+  --paged_prefill_scratch_slots 1 \
+  --max_slots 32 \
+  --arrival_rates inf \
+  --num_requests 32 \
+  --workload /home/dzy/za/tmp/real_workload_14b_p128d128.jsonl \
+  --ignore_eos \
+  --csv llaisys_tp2_p128d128.csv
+```
 
 ---
 
-## 5. 结果与性能
+## Benchmark 结果
 
-### 5.1 CPU：1.5B（`feature/cpu`，128 tokens 量级）
+### p128d128 Controlled Serving
 
-**配置**：模型 **DeepSeek-R1-Distill-Qwen-1.5B**，分支 **`feature/cpu`**，`--test`，`--device cpu`；运行方式见 **§4.1**。  
-**硬件参考**：Intel Xeon Platinum 8358P @ 2.60GHz，**15 vCPU**，内存约 90GB。
+测试设置：
 
-| 指标 | 优化前 | 优化后 | 提升（约） |
-|------|---------------------|--------|------------|
-| 端到端生成耗时 | ~514 s | **~7.4–7.9 s** | **~65×–71×** |
-| 每 token 平均延时（同口径） | ~4.0 s | ~0.06 s | 同量级 |
+```text
+model = DeepSeek-R1-Distill-Qwen-14B
+dtype = BF16
+prompt_len = 128
+output_len = 128
+requests = 32
+arrival = inf
+ignore_eos = true
+input = real ShareGPT token-id prompts
+```
 
-### 5.2 GPU：单卡 LLAISYS vs HuggingFace BF16（**RTX 3090**）
+LLAISYS 结果：
 
-**配置**：模型 **DeepSeek-R1-Distill-Qwen-1.5B**，分支 **`perf/cutlass` 或 `feature/tp`**（单卡），`--test`，`--device nvidia`，`test/dzy_test_infer.py`；运行方式见 **§4.2**。
 
-| 项 | LLAISYS | HuggingFace BF16 参考 |
-|----|---------|------------------------|
-| 端到端耗时（同任务设定） | **~0.8 s** | ~3.2 s |
-| 峰值显存（LLAISYS 侧） | **~7.5 GB** | — |
-| 吞吐 | prefill **~692 tok/s**，decode **~98 tok/s** | — |
+| 系统      | 配置                              | Output tok/s | 说明                               |
+| ------- | ------------------------------- | ------------ | -------------------------------- |
+| LLAISYS | TP=1 Paged KV                   | 456          | 默认 paged attention               |
+| LLAISYS | TP=1 Paged KV + Paged Attention | 474          | paged decode attention 特化 kernel |
+| LLAISYS | TP=2 Paged KV                   | 632          | prefill workspace 后              |
+| LLAISYS | TP=2 Paged KV + Paged Attention | 653          | 当前 controlled benchmark 最优结果     |
 
-### 5.3 双卡 TP：14B（**2×A800 NVLink**，`feature/tp`，`test/tp_infer.py` **PD 统计**）
 
-**配置**：DeepSeek-R1-Distill-Qwen-14B，**TP=2**，`--test`；命令见 **§4.3**。
+TP=2 最优配置的 serving 指标：
 
-| 指标 | 数值（本次实测） |
-|------|------------------|
-| **Prefill** | **~25.7 tok/s**（**9** 个 prompt token，约 **0.35 s**） |
-| **Decode** | **~22.6 tok/s**（**81** 个生成 token，约 **3.59 s**） |
-| **Decode** | **~22.3 tok/s**（**80** steps，约 **3.59 s**） |
-| **显存峰值** | **GPU0 ~17125 MiB**，**GPU1 ~15639 MiB** |
+
+| 指标                          | 数值                |
+| --------------------------- | ----------------- |
+| Completed requests          | 32                |
+| Wall time                   | 6.27 s            |
+| QPS                         | 5.10 req/s        |
+| Output throughput           | 653 output tok/s  |
+| Total token throughput      | 1306 tok/s        |
+| Avg TTFT                    | 1166 ms           |
+| P90 / P99 TTFT              | 1867 ms / 2034 ms |
+| Avg TPOT                    | 39.3 ms           |
+| P99 latency                 | 6154 ms           |
+| Peak memory                 | 23349 MiB         |
+| Avg / Max active batch      | 31.7 / 32         |
+| Prefill time                | 2.03 s            |
+| Decode time                 | 4.15 s            |
+| Decode step time            | 32.7 ms           |
+| KV block size               | 16 tokens         |
+| Peak used KV blocks         | 512               |
+| KV capacity                 | 65536 tokens      |
+| Used KV blocks after finish | 0                 |
+
+
+### vLLM 对齐测试
+
+为了对齐成熟 serving 框架，LLAISYS benchmark 支持使用相同 token-id prompt 调用 vLLM OpenAI serving。相同 p128d128、32 requests、max concurrency=32 输入下，vLLM 结果如下：
+
+
+| 系统        | Output tok/s | Total tok/s | 平均 latency | p99 latency |
+| --------- | ------------ | ----------- | ---------- | ----------- |
+| vLLM TP=1 | 950          | 1899        | 4242 ms    | 4302 ms     |
+| vLLM TP=2 | 1874         | 3747        | 2182 ms    | 2185 ms     |
+
+
+LLAISYS 当前重点是实现并分析推理系统核心机制，包括 TP、Paged KV、Continuous Batching、prefill/decode profiling 与 serving benchmark。与 vLLM 的差距主要来自成熟框架中的高性能 paged attention、CUDA Graph bucket、varlen prefill 与 scheduler 策略。
 
 ---
 
+## 核心实现
+
+### TP=2 Tensor Parallel
+
+LLAISYS 的 TP=2 路径采用 Megatron-style 张量并行：
+
+- QKV / Gate-Up 使用列并行，每张卡计算部分输出通道。
+- O-Proj / Down-Proj 使用行并行，每张卡计算部分输入贡献。
+- 每层在 O-Proj / MLP Down 后执行 NCCL AllReduce 聚合 hidden states。
+- 每个 rank 维护本地 KV cache，并在本地执行 GQA attention。
+- Python 侧使用 Safetensors 按 rank 分片加载权重，再通过 C API 注册到 C++ 后端。
+
+### Continuous Batching
+
+Continuous Batching 用于 online serving 场景。每个请求占用一个 slot，并独立维护：
+
+- `slot_id`
+- `seq_len`
+- `last_token`
+- `finished`
+- KV cache 位置
+
+Scheduler 每轮收集 active slots，将它们组成 decode batch。请求完成后释放 slot，新请求可以继续进入，从而避免传统 lockstep batch 必须一起开始、一起结束的问题。
+
+### Paged KV Cache / Block Manager
+
+Fixed-slot KV 会为每个 slot 预留完整 `maxseq`：
+
+```text
+[max_slots, maxseq, n_kv_heads, head_dim]
+```
+
+Paged KV 将 KV cache 切成 token blocks：
+
+```text
+[num_blocks, block_size, n_kv_heads, head_dim]
+```
+
+每个请求通过 block table 记录逻辑 block 到物理 block 的映射：
+
+```text
+block_table[slot, logical_block] -> physical_block
+```
+
+这样请求只按实际 token 数申请 KV block，请求结束后释放 block 并复用，提升显存利用率与并发能力。
+
+### Paged Decode Attention
+
+Paged Decode Attention 在 decode 阶段直接通过 block table 从 paged KV cache 读取历史 K/V，避免将 KV gather 成连续 buffer。
+
+当前实现包含：
+
+- 默认 paged attention kernel
+- block-table cache
+- BR tile 调参
+- paged attention 特化 kernel
+
+Paged Attention 针对 `block_size=16`、`head_dim=128` 的 decode 场景做特化，按 paged block 扫描 KV，减少 position 到 physical block 的重复映射开销。
+
+### Chunked Prefill + Decode Interleave
+
+高压 online serving 中，如果先 prefill 所有请求，再进入 decode，会导致 TTFT 很高。LLAISYS 实现了 chunked prefill + decode interleave 实验路径：
+
+- 将 prefill 按 token budget 分 chunk 推进。
+- 每轮穿插 active requests 的 decode。
+- 避免长 prompt prefill 长时间阻塞 decode。
+
+### Profiling 与实验路径
+
+LLAISYS 提供多种 profiling 与 A/B 开关：
+
+
+| 开关                              | 作用                            |
+| ------------------------------- | ----------------------------- |
+| `LLAISYS_PREFILL_TIMING=1`      | 拆解 prefill 耗时                 |
+| `LLAISYS_DECODE_TIMING=1`       | 拆解 decode 耗时                  |
+| `LLAISYS_TP_TIMING=1`           | 拆解 NCCL AllReduce 耗时          |
+| `LLAISYS_PAGED_ATTN_V2=1`       | 启用 paged attention 特化 kernel  |
+| `LLAISYS_ENABLE_DECODE_GRAPH=1` | 尝试 decode CUDA Graph fallback |
+| `LLAISYS_TP_OVERLAP=1`          | 启用 NCCL async allreduce 实验路径  |
+| `LLAISYS_FUSED_QKV=1`           | 启用 fused QKV GEMM 实验路径        |
+| `LLAISYS_FUSED_GATE_UP=1`       | 启用 fused GateUp GEMM 实验路径     |
+
+
+---
+
+## Roadmap
+
+- 高性能 paged attention / GQA paged attention。
+- Varlen prefill attention。
+- CUDA Graph bucket for decode。
+- 更成熟的 waiting/running scheduler。
+- TP 通信与计算 overlap。
+- Prefix cache / prefix sharing。
+- KV cache quantization。
+
+---
+
+## License
+
+本项目遵循仓库中的 LICENSE。
