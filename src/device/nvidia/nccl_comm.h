@@ -17,6 +17,8 @@ public:
     NcclComm& operator=(const NcclComm&) = delete;
 
     void allreduceSum(const std::vector<void*>& bufs, size_t count, llaisysDataType_t dtype);
+    void allreduceSumAsync(const std::vector<void*>& bufs, size_t count, llaisysDataType_t dtype);
+    void waitAllreduce();
     void syncAll();
 
     int size() const;

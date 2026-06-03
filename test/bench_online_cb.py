@@ -249,7 +249,12 @@ def run_one(model, args, arrival_rate, device_ids):
         records = load_workload(args.workload)
         rng.shuffle(records)
         if args.num_requests > 0:
-            records = records[: args.num_requests]
+            if len(records) < args.num_requests:
+                records = [dict(records[i % len(records)]) for i in range(args.num_requests)]
+                for i, rec in enumerate(records):
+                    rec["request_id"] = i
+            else:
+                records = records[: args.num_requests]
         requests = assign_arrivals(records, arrival_rate, args.duration, rng, args.arrival_pattern)
     else:
         requests = build_requests(
@@ -564,8 +569,6 @@ def main():
     eos_group.add_argument("--respect_eos", dest="ignore_eos", action="store_false")
     args = parser.parse_args()
     if args.kv_mode == "paged":
-        if len(parse_int_list(args.device_ids)) != 1:
-            raise ValueError("kv_mode=paged is TP=1 only in the MVP")
         if args.paged_max_blocks <= 0:
             raise ValueError("--paged_max_blocks must be > 0 when --kv_mode paged")
     if not args.csv:
@@ -581,7 +584,7 @@ def main():
 
     device_ids = parse_int_list(args.device_ids)
     if len(device_ids) != 1:
-        print("Warning: continuous batching demo is validated for single GPU; running with provided device_ids.")
+        print("Warning: multi-GPU continuous batching is experimental; running with provided device_ids.")
 
     model = Qwen2TP(Path(args.model), llaisys.DeviceType.NVIDIA, device_ids=device_ids)
     rows = []

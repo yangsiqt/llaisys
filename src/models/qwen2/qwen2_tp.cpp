@@ -169,7 +169,7 @@ Qwen2TPModel::Qwen2TPModel(const Qwen2Config& config, llaisysDeviceType_t device
       max_slots_(1), paged_kv_mode_(false), paged_block_size_(0),
       paged_max_blocks_(0), paged_max_blocks_per_slot_(0),
       prefill_scratch_slots_(0), paged_peak_used_blocks_(0),
-      continuous_ready_(false)
+      continuous_ready_(false), prefill_workspace_capacity_(0)
 #ifdef ENABLE_NVIDIA_API
       , decode_graph_ready_(false), decode_graph_batch_(0),
         decode_graph_(nullptr), decode_graph_exec_(nullptr)
@@ -255,7 +255,6 @@ void Qwen2TPModel::init_continuous(size_t max_slots) {
 
 void Qwen2TPModel::init_paged_continuous(size_t max_slots, size_t block_size,
                                          size_t max_blocks, size_t prefill_scratch_slots) {
-    CHECK_ARGUMENT(tp_size_ == 1, "init_paged_continuous: TP=1 only in MVP");
     CHECK_ARGUMENT(device_type_ == LLAISYS_DEVICE_NVIDIA, "init_paged_continuous: CUDA only in MVP");
     CHECK_ARGUMENT(max_slots >= 1, "init_paged_continuous: max_slots must be >= 1");
     CHECK_ARGUMENT(block_size >= 1, "init_paged_continuous: block_size must be >= 1");
@@ -294,6 +293,8 @@ void Qwen2TPModel::init_continuous_common(size_t max_slots, size_t kv_slots) {
                         nkvh_per_rank_, config_.dh, config_.dtype, device_type_, dev_id);
     }
     decode_meta_.resize(tp_size_);
+    prefill_meta_.resize(tp_size_);
+    prefill_workspace_capacity_ = 0;
 #ifdef ENABLE_NVIDIA_API
     if (decode_graph_exec_) {
         cudaGraphExecDestroy(reinterpret_cast<cudaGraphExec_t>(decode_graph_exec_));
@@ -659,6 +660,42 @@ PagedKVStats Qwen2TPModel::paged_kv_stats() const {
     return stats;
 }
 
+void Qwen2TPModel::ensure_prefill_workspace(size_t flat_seq_len) {
+    if (flat_seq_len <= prefill_workspace_capacity_) return;
+    size_t new_capacity = std::max<size_t>(flat_seq_len, prefill_workspace_capacity_ * 2);
+    if (new_capacity == 0) new_capacity = flat_seq_len;
+    prefill_meta_.resize(tp_size_);
+    for (int rank = 0; rank < tp_size_; rank++) {
+        int dev_id = device_ids_[rank];
+        core::context().setDevice(device_type_, dev_id);
+        auto& meta = prefill_meta_[rank];
+        meta.input_ids = Tensor::create({new_capacity}, LLAISYS_DTYPE_I64, device_type_, dev_id);
+        meta.hidden_a = Tensor::create({new_capacity, config_.hs}, config_.dtype, device_type_, dev_id);
+        meta.hidden_b = Tensor::create({new_capacity, config_.hs}, config_.dtype, device_type_, dev_id);
+        meta.attn_norm = Tensor::create({new_capacity, config_.hs}, config_.dtype, device_type_, dev_id);
+        meta.qkv_flat = Tensor::create(
+            {new_capacity, (nh_per_rank_ + 2 * nkvh_per_rank_) * config_.dh}, config_.dtype, device_type_, dev_id);
+        meta.q_flat = Tensor::create({new_capacity, nh_per_rank_ * config_.dh}, config_.dtype, device_type_, dev_id);
+        meta.k_flat = Tensor::create({new_capacity, nkvh_per_rank_ * config_.dh}, config_.dtype, device_type_, dev_id);
+        meta.v_flat = Tensor::create({new_capacity, nkvh_per_rank_ * config_.dh}, config_.dtype, device_type_, dev_id);
+        meta.pos_ids = Tensor::create({new_capacity}, LLAISYS_DTYPE_I64, device_type_, dev_id);
+        meta.attn_out = Tensor::create({new_capacity, nh_per_rank_, config_.dh}, config_.dtype, device_type_, dev_id);
+        meta.o_proj = Tensor::create({new_capacity, config_.hs}, config_.dtype, device_type_, dev_id);
+        meta.hidden_1 = Tensor::create({new_capacity, config_.hs}, config_.dtype, device_type_, dev_id);
+        meta.mlp_norm = Tensor::create({new_capacity, config_.hs}, config_.dtype, device_type_, dev_id);
+        meta.gate_up_out = Tensor::create({new_capacity, 2 * di_per_rank_}, config_.dtype, device_type_, dev_id);
+        meta.gate_out = Tensor::create({new_capacity, di_per_rank_}, config_.dtype, device_type_, dev_id);
+        meta.up_out = Tensor::create({new_capacity, di_per_rank_}, config_.dtype, device_type_, dev_id);
+        meta.swiglu_out = Tensor::create({new_capacity, di_per_rank_}, config_.dtype, device_type_, dev_id);
+        meta.mlp_out = Tensor::create({new_capacity, config_.hs}, config_.dtype, device_type_, dev_id);
+        meta.out_norm = Tensor::create({new_capacity, config_.hs}, config_.dtype, device_type_, dev_id);
+        if (rank == 0) {
+            meta.logits = Tensor::create({new_capacity, config_.voc}, config_.dtype, device_type_, dev_id);
+        }
+    }
+    prefill_workspace_capacity_ = new_capacity;
+}
+
 void Qwen2TPModel::copy_prefill_to_paged_cache(const std::vector<size_t>& real_slot_ids,
                                                const std::vector<size_t>& scratch_slot_ids,
                                                size_t prompt_len) {
@@ -724,7 +761,7 @@ void Qwen2TPModel::setLayerWeight(int rank, const std::string& name, size_t laye
     rebuild_decode_fused_weights(w, layer_idx);
 }
 
-void Qwen2TPModel::allreduce_sum(std::vector<tensor_t>& tensors) {
+void Qwen2TPModel::allreduce_sum(std::vector<tensor_t>& tensors, const char* label) {
     if (tp_size_ <= 1) return;
 
 #ifdef ENABLE_NVIDIA_API
@@ -734,9 +771,19 @@ void Qwen2TPModel::allreduce_sum(std::vector<tensor_t>& tensors) {
         for (int i = 0; i < tp_size_; i++) {
             bufs[i] = tensors[i]->data();
         }
-        nccl_comm_->allreduceSum(bufs, tensors[0]->numel(), tensors[0]->dtype());
+        const bool overlap_env = env_flag_enabled("LLAISYS_TP_OVERLAP");
+        const bool decode_label = label && std::strncmp(label, "decode_", 7) == 0;
+        if (overlap_env && decode_label) {
+            nccl_comm_->allreduceSumAsync(bufs, tensors[0]->numel(), tensors[0]->dtype());
+            nccl_comm_->waitAllreduce();
+        } else {
+            nccl_comm_->allreduceSum(bufs, tensors[0]->numel(), tensors[0]->dtype());
+        }
         if (env_flag_enabled("LLAISYS_TP_TIMING")) {
-            std::cerr << "[TP timing] allreduce numel=" << tensors[0]->numel()
+            std::cerr << "[TP timing] allreduce";
+            if (label) std::cerr << " label=" << label;
+            if (overlap_env && decode_label) std::cerr << " mode=async_wait";
+            std::cerr << " numel=" << tensors[0]->numel()
                       << " ms=" << ms_since(t0) << std::endl;
         }
     }
@@ -817,7 +864,9 @@ tensor_t Qwen2TPModel::forward(const std::vector<int64_t>& new_tokens, size_t st
 tensor_t Qwen2TPModel::forward_slots(const std::vector<int64_t>& new_tokens, const std::vector<size_t>& slot_ids,
                                      size_t start_pos, size_t seq_len) {
     size_t batch_size = slot_ids.size();
+    size_t flat_seq_len = batch_size * seq_len;
     CHECK_ARGUMENT(new_tokens.size() == batch_size * seq_len, "forward_slots: token count mismatch");
+    ensure_prefill_workspace(flat_seq_len);
     const bool timing = env_flag_enabled("LLAISYS_PREFILL_TIMING");
     auto total_t0 = std::chrono::steady_clock::now();
     auto phase_t0 = total_t0;
@@ -826,11 +875,12 @@ tensor_t Qwen2TPModel::forward_slots(const std::vector<int64_t>& new_tokens, con
     for (int rank = 0; rank < tp_size_; rank++) {
         int dev_id = device_ids_[rank];
         core::context().setDevice(device_type_, dev_id);
+        auto& meta = prefill_meta_[rank];
 
-        tensor_t input_ids = Tensor::create({batch_size * seq_len}, LLAISYS_DTYPE_I64, device_type_, dev_id);
+        tensor_t input_ids = meta.input_ids->slice(0, 0, flat_seq_len);
         input_ids->load(new_tokens.data());
 
-        hidden_states[rank] = Tensor::create({batch_size * seq_len, config_.hs}, config_.dtype, device_type_, dev_id);
+        hidden_states[rank] = meta.hidden_a->slice(0, 0, flat_seq_len);
         ops::embedding(hidden_states[rank], input_ids, ranks_[rank].weights.in_embed);
     }
     if (timing) {
@@ -853,10 +903,10 @@ tensor_t Qwen2TPModel::forward_slots(const std::vector<int64_t>& new_tokens, con
     int dev_id = device_ids_[0];
     core::context().setDevice(device_type_, dev_id);
 
-    tensor_t normed = Tensor::create({batch_size * seq_len, config_.hs}, config_.dtype, device_type_, dev_id);
+    tensor_t normed = prefill_meta_[0].out_norm->slice(0, 0, flat_seq_len);
     ops::rms_norm(normed, hidden_states[0], ranks_[0].weights.out_norm_w, config_.epsilon);
 
-    tensor_t logits = Tensor::create({batch_size * seq_len, config_.voc}, config_.dtype, device_type_, dev_id);
+    tensor_t logits = prefill_meta_[0].logits->slice(0, 0, flat_seq_len);
     ops::linear(logits, normed, ranks_[0].weights.out_embed, nullptr);
     if (timing) {
         sync_device_for_timing(device_type_);
@@ -1048,27 +1098,22 @@ void Qwen2TPModel::apply_layer_slots(size_t layer_idx, std::vector<tensor_t>& hi
         int dev_id = device_ids_[rank];
         core::context().setDevice(device_type_, dev_id);
         auto& w = ranks_[rank].weights;
+        auto& meta = prefill_meta_[rank];
 
         // Attention norm
-        tensor_t attn_norm_out = Tensor::create(
-            {flat_seq_len, config_.hs}, config_.dtype, device_type_, dev_id);
+        tensor_t attn_norm_out = meta.attn_norm->slice(0, 0, flat_seq_len);
         ops::rms_norm(attn_norm_out, hidden_states[rank], w.attn_norm_w[layer_idx], config_.epsilon);
 
         // Q/K/V projections (column-parallel: sharded output dim)
-        tensor_t q_flat = Tensor::create(
-            {flat_seq_len, nh_per_rank_ * config_.dh}, config_.dtype, device_type_, dev_id);
-        tensor_t k_flat = Tensor::create(
-            {flat_seq_len, nkvh_per_rank_ * config_.dh}, config_.dtype, device_type_, dev_id);
-        tensor_t v_flat = Tensor::create(
-            {flat_seq_len, nkvh_per_rank_ * config_.dh}, config_.dtype, device_type_, dev_id);
+        tensor_t q_flat = meta.q_flat->slice(0, 0, flat_seq_len);
+        tensor_t k_flat = meta.k_flat->slice(0, 0, flat_seq_len);
+        tensor_t v_flat = meta.v_flat->slice(0, 0, flat_seq_len);
 
         const char* fused_qkv_env = std::getenv("LLAISYS_FUSED_QKV");
         const bool use_fused_qkv = fused_qkv_env && std::atoi(fused_qkv_env) != 0 &&
                                    w.attn_qkv_w[layer_idx] && w.attn_qkv_b[layer_idx];
         if (use_fused_qkv) {
-            tensor_t qkv_flat = Tensor::create(
-                {flat_seq_len, (nh_per_rank_ + 2 * nkvh_per_rank_) * config_.dh},
-                config_.dtype, device_type_, dev_id);
+            tensor_t qkv_flat = meta.qkv_flat->slice(0, 0, flat_seq_len);
             ops::linear(qkv_flat, attn_norm_out, w.attn_qkv_w[layer_idx], w.attn_qkv_b[layer_idx]);
             ops::split_qkv_decode(q_flat, k_flat, v_flat, qkv_flat);
         } else {
@@ -1087,7 +1132,7 @@ void Qwen2TPModel::apply_layer_slots(size_t layer_idx, std::vector<tensor_t>& hi
             for (size_t i = 0; i < seq_len; i++)
                 pos_ids_vec[b * seq_len + i] = start_pos + i;
         }
-        tensor_t pos_ids = Tensor::create({flat_seq_len}, LLAISYS_DTYPE_I64, device_type_, dev_id);
+        tensor_t pos_ids = meta.pos_ids->slice(0, 0, flat_seq_len);
         pos_ids->load(pos_ids_vec.data());
         ops::rope(q, q, pos_ids, config_.theta);
         ops::rope(k, k, pos_ids, config_.theta);
@@ -1099,53 +1144,53 @@ void Qwen2TPModel::apply_layer_slots(size_t layer_idx, std::vector<tensor_t>& hi
         scatter_kv_to_cache_slots(kv_cache.v_cache, v, slot_ids, start_pos, seq_len);
         kv_cache.current_seq_len = kv_seq_len;
 
-        // Gather full K/V from cache
-        tensor_t full_k = gather_kv_from_cache_slots(kv_cache.k_cache, slot_ids, kv_seq_len,
-                                                     config_.dtype, device_type_, dev_id);
-        tensor_t full_v = gather_kv_from_cache_slots(kv_cache.v_cache, slot_ids, kv_seq_len,
-                                                     config_.dtype, device_type_, dev_id);
+        // For the common full-prompt prefill path, projected K/V already cover
+        // the entire attention window. Chunked prefill still gathers prior KV.
+        tensor_t full_k = k;
+        tensor_t full_v = v;
+        if (start_pos != 0) {
+            full_k = gather_kv_from_cache_slots(kv_cache.k_cache, slot_ids, kv_seq_len,
+                                                config_.dtype, device_type_, dev_id);
+            full_v = gather_kv_from_cache_slots(kv_cache.v_cache, slot_ids, kv_seq_len,
+                                                config_.dtype, device_type_, dev_id);
+        }
 
         // Self-attention
-        tensor_t attn_out = Tensor::create(
-            {flat_seq_len, nh_per_rank_, config_.dh}, config_.dtype, device_type_, dev_id);
+        tensor_t attn_out = meta.attn_out->slice(0, 0, flat_seq_len);
         ops::self_attention(attn_out, q, full_k, full_v, scale, seq_len);
 
         // O projection (row-parallel: sharded input dim)
         tensor_t attn_out_flat = attn_out->view({flat_seq_len, nh_per_rank_ * config_.dh});
-        o_proj[rank] = Tensor::create({flat_seq_len, config_.hs}, config_.dtype, device_type_, dev_id);
+        o_proj[rank] = meta.o_proj->slice(0, 0, flat_seq_len);
         ops::linear(o_proj[rank], attn_out_flat, w.attn_o_w[layer_idx], nullptr);
     }
 
     // All-reduce after O projection
-    allreduce_sum(o_proj);
+    allreduce_sum(o_proj, "prefill_o");
 
     // Phase 2: Residual + MLP
     for (int rank = 0; rank < tp_size_; rank++) {
         int dev_id = device_ids_[rank];
         core::context().setDevice(device_type_, dev_id);
         auto& w = ranks_[rank].weights;
+        auto& meta = prefill_meta_[rank];
 
         // Residual
-        hidden_states_1[rank] = Tensor::create(
-            {flat_seq_len, config_.hs}, config_.dtype, device_type_, dev_id);
+        hidden_states_1[rank] = meta.hidden_1->slice(0, 0, flat_seq_len);
         ops::add(hidden_states_1[rank], hidden_states[rank], o_proj[rank]);
 
         // MLP norm
-        tensor_t mlp_norm_out = Tensor::create(
-            {flat_seq_len, config_.hs}, config_.dtype, device_type_, dev_id);
+        tensor_t mlp_norm_out = meta.mlp_norm->slice(0, 0, flat_seq_len);
         ops::rms_norm(mlp_norm_out, hidden_states_1[rank], w.mlp_norm_w[layer_idx], config_.epsilon);
 
         // Gate/Up projections (column-parallel)
-        tensor_t gate_out = Tensor::create(
-            {flat_seq_len, di_per_rank_}, config_.dtype, device_type_, dev_id);
-        tensor_t up_out = Tensor::create(
-            {flat_seq_len, di_per_rank_}, config_.dtype, device_type_, dev_id);
+        tensor_t gate_out = meta.gate_out->slice(0, 0, flat_seq_len);
+        tensor_t up_out = meta.up_out->slice(0, 0, flat_seq_len);
         const char* fused_gate_env = std::getenv("LLAISYS_FUSED_GATE_UP");
         const bool use_fused_gate_up = fused_gate_env && std::atoi(fused_gate_env) != 0 &&
                                        w.mlp_gate_up_w[layer_idx];
         if (use_fused_gate_up) {
-            tensor_t gate_up_out = Tensor::create(
-                {flat_seq_len, 2 * di_per_rank_}, config_.dtype, device_type_, dev_id);
+            tensor_t gate_up_out = meta.gate_up_out->slice(0, 0, flat_seq_len);
             ops::linear(gate_up_out, mlp_norm_out, w.mlp_gate_up_w[layer_idx], nullptr);
             ops::split_gate_up_decode(gate_out, up_out, gate_up_out);
         } else {
@@ -1154,26 +1199,29 @@ void Qwen2TPModel::apply_layer_slots(size_t layer_idx, std::vector<tensor_t>& hi
         }
 
         // SwiGLU
-        tensor_t swiglu_out = Tensor::create(
-            {flat_seq_len, di_per_rank_}, config_.dtype, device_type_, dev_id);
+        tensor_t swiglu_out = meta.swiglu_out->slice(0, 0, flat_seq_len);
         ops::swiglu(swiglu_out, gate_out, up_out);
 
         // Down projection (row-parallel)
-        mlp_out[rank] = Tensor::create(
-            {flat_seq_len, config_.hs}, config_.dtype, device_type_, dev_id);
+        mlp_out[rank] = meta.mlp_out->slice(0, 0, flat_seq_len);
         ops::linear(mlp_out[rank], swiglu_out, w.mlp_down_w[layer_idx], nullptr);
     }
 
     // All-reduce after Down projection
-    allreduce_sum(mlp_out);
+    allreduce_sum(mlp_out, "prefill_mlp");
 
     // Phase 3: Final residual
     for (int rank = 0; rank < tp_size_; rank++) {
         int dev_id = device_ids_[rank];
         core::context().setDevice(device_type_, dev_id);
+        auto& meta = prefill_meta_[rank];
 
-        tensor_t output = Tensor::create(
-            {flat_seq_len, config_.hs}, config_.dtype, device_type_, dev_id);
+        tensor_t output;
+        if (hidden_states[rank]->data() == meta.hidden_a->data()) {
+            output = meta.hidden_b->slice(0, 0, flat_seq_len);
+        } else {
+            output = meta.hidden_a->slice(0, 0, flat_seq_len);
+        }
         ops::add(output, hidden_states_1[rank], mlp_out[rank]);
         hidden_states[rank] = output;
     }
@@ -1271,7 +1319,7 @@ void Qwen2TPModel::apply_layer_slots_decode(size_t layer_idx, std::vector<tensor
         ops::linear(o_proj[rank], attn_out_flat, w.attn_o_w[layer_idx], nullptr);
     }
 
-    allreduce_sum(o_proj);
+    allreduce_sum(o_proj, "decode_o");
 
     for (int rank = 0; rank < tp_size_; rank++) {
         int dev_id = device_ids_[rank];
@@ -1306,7 +1354,7 @@ void Qwen2TPModel::apply_layer_slots_decode(size_t layer_idx, std::vector<tensor
         ops::linear(mlp_out[rank], swiglu_out, w.mlp_down_w[layer_idx], nullptr);
     }
 
-    allreduce_sum(mlp_out);
+    allreduce_sum(mlp_out, "decode_mlp");
 
     for (int rank = 0; rank < tp_size_; rank++) {
         int dev_id = device_ids_[rank];

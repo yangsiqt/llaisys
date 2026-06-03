@@ -79,7 +79,7 @@ struct NcclComm::Impl {
         }
     }
 
-    void allreduceSum(const std::vector<void*>& bufs, size_t count, llaisysDataType_t dtype) {
+    void allreduceSumAsync(const std::vector<void*>& bufs, size_t count, llaisysDataType_t dtype) {
         ncclDataType_t nccl_type = toNcclType(dtype);
 
         // Record an event on the default (compute) stream of each device,
@@ -102,8 +102,19 @@ struct NcclComm::Impl {
         for (int i = 0; i < world_size; i++) {
             CUDA_CHECK(cudaSetDevice(device_ids[i]));
             CUDA_CHECK(cudaEventRecord(nccl_done_events[i], streams[i]));
+        }
+    }
+
+    void waitAllreduce() {
+        for (int i = 0; i < world_size; i++) {
+            CUDA_CHECK(cudaSetDevice(device_ids[i]));
             CUDA_CHECK(cudaStreamWaitEvent(nullptr, nccl_done_events[i], 0));
         }
+    }
+
+    void allreduceSum(const std::vector<void*>& bufs, size_t count, llaisysDataType_t dtype) {
+        allreduceSumAsync(bufs, count, dtype);
+        waitAllreduce();
     }
 
     void syncAll() {
@@ -121,6 +132,14 @@ NcclComm::~NcclComm() = default;
 
 void NcclComm::allreduceSum(const std::vector<void*>& bufs, size_t count, llaisysDataType_t dtype) {
     impl_->allreduceSum(bufs, count, dtype);
+}
+
+void NcclComm::allreduceSumAsync(const std::vector<void*>& bufs, size_t count, llaisysDataType_t dtype) {
+    impl_->allreduceSumAsync(bufs, count, dtype);
+}
+
+void NcclComm::waitAllreduce() {
+    impl_->waitAllreduce();
 }
 
 void NcclComm::syncAll() {
