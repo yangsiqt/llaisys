@@ -2,9 +2,11 @@
 #include "../../ops/ops.hpp"
 #include "../../utils.hpp"
 #include "../../core/context/context.hpp"
+#include "../../utils/nvtx.hpp"
 #include <iostream>
 #include <cstring>
 #include <cmath>
+#include <string>
 
 namespace llaisys {
 namespace models {
@@ -65,6 +67,7 @@ void Qwen2Model::reset_cache() {
 }
 
 int64_t Qwen2Model::infer(const std::vector<int64_t>& token_ids) {
+    LLAISYS_NVTX_RANGE("infer_step");
     CHECK_ARGUMENT(!token_ids.empty(), "infer: token_ids must not be empty");
 
     // Heuristic: if a new (shorter) sequence is provided, reset KV cache.
@@ -86,7 +89,11 @@ int64_t Qwen2Model::infer(const std::vector<int64_t>& token_ids) {
     input_ids->load(token_ids.data() + start_pos);
 
     // Forward pass for the new segment only (will attend to cached K/V).
-    tensor_t logits = forward(input_ids, start_pos);
+    tensor_t logits;
+    {
+        LLAISYS_NVTX_RANGE(start_pos == 0 ? "prefill_forward" : "decode_forward");
+        logits = forward(input_ids, start_pos);
+    }
 
     // Update position to total cached length.
     current_pos_ = total_len;
@@ -98,7 +105,10 @@ int64_t Qwen2Model::infer(const std::vector<int64_t>& token_ids) {
     // Argmax to get next token
     tensor_t max_idx = Tensor::create({1}, LLAISYS_DTYPE_I64, device_type_, device_id);
     tensor_t max_val = Tensor::create({1}, config_.dtype, device_type_, device_id);
-    ops::argmax(max_idx, max_val, last_logits->view({config_.voc}));
+    {
+        LLAISYS_NVTX_RANGE("argmax");
+        ops::argmax(max_idx, max_val, last_logits->view({config_.voc}));
+    }
     
     // Get result from tensor
     int64_t next_token;
@@ -119,20 +129,31 @@ tensor_t Qwen2Model::forward(const tensor_t& input_ids, size_t start_pos) {
     // Token embedding: [seq_len] -> [seq_len, hidden_size]
     tensor_t hidden_states = Tensor::create({seq_len, config_.hs}, config_.dtype, device_type_, device_id);
     
-    ops::embedding(hidden_states, input_ids, weights_.in_embed);
+    {
+        LLAISYS_NVTX_RANGE("embedding");
+        ops::embedding(hidden_states, input_ids, weights_.in_embed);
+    }
     
     // Apply each transformer layer
     for (size_t layer_idx = 0; layer_idx < config_.nlayer; layer_idx++) {
+        std::string range_name = "layer_" + std::to_string(layer_idx);
+        LLAISYS_NVTX_RANGE(range_name.c_str());
         hidden_states = apply_layer(layer_idx, hidden_states, start_pos);
     }
     
     // Final layer norm
     tensor_t normed = Tensor::create({seq_len, config_.hs}, config_.dtype, device_type_, device_id);
-    ops::rms_norm(normed, hidden_states, weights_.out_norm_w, config_.epsilon);
+    {
+        LLAISYS_NVTX_RANGE("final_rms_norm");
+        ops::rms_norm(normed, hidden_states, weights_.out_norm_w, config_.epsilon);
+    }
     
     // Output projection: [seq_len, hidden_size] -> [seq_len, vocab_size]
     tensor_t logits = Tensor::create({seq_len, config_.voc}, config_.dtype, device_type_, device_id);
-    ops::linear(logits, normed, weights_.out_embed, nullptr);
+    {
+        LLAISYS_NVTX_RANGE("lm_head");
+        ops::linear(logits, normed, weights_.out_embed, nullptr);
+    }
     
     return logits;
 }
@@ -143,7 +164,10 @@ tensor_t Qwen2Model::apply_layer(size_t layer_idx, const tensor_t& hidden_states
     
     // 1. Attention norm
     tensor_t attn_norm_out = Tensor::create({seq_len, config_.hs}, config_.dtype, device_type_, device_id);
-    ops::rms_norm(attn_norm_out, hidden_states, weights_.attn_norm_w[layer_idx], config_.epsilon);
+    {
+        LLAISYS_NVTX_RANGE("attention_rms_norm");
+        ops::rms_norm(attn_norm_out, hidden_states, weights_.attn_norm_w[layer_idx], config_.epsilon);
+    }
     
     // 2. Q, K, V projections
     tensor_t q = Tensor::create({seq_len, config_.nh, config_.dh}, config_.dtype, device_type_, device_id);
@@ -155,9 +179,12 @@ tensor_t Qwen2Model::apply_layer(size_t layer_idx, const tensor_t& hidden_states
     tensor_t k_flat = Tensor::create({seq_len, config_.nkvh * config_.dh}, config_.dtype, device_type_, device_id);
     tensor_t v_flat = Tensor::create({seq_len, config_.nkvh * config_.dh}, config_.dtype, device_type_, device_id);
     
-    ops::linear(q_flat, attn_norm_out, weights_.attn_q_w[layer_idx], weights_.attn_q_b[layer_idx]);
-    ops::linear(k_flat, attn_norm_out, weights_.attn_k_w[layer_idx], weights_.attn_k_b[layer_idx]);
-    ops::linear(v_flat, attn_norm_out, weights_.attn_v_w[layer_idx], weights_.attn_v_b[layer_idx]);
+    {
+        LLAISYS_NVTX_RANGE("qkv_projection");
+        ops::linear(q_flat, attn_norm_out, weights_.attn_q_w[layer_idx], weights_.attn_q_b[layer_idx]);
+        ops::linear(k_flat, attn_norm_out, weights_.attn_k_w[layer_idx], weights_.attn_k_b[layer_idx]);
+        ops::linear(v_flat, attn_norm_out, weights_.attn_v_w[layer_idx], weights_.attn_v_b[layer_idx]);
+    }
     
     // Reshape to [seq_len, num_heads, head_dim]
     q = q_flat->view({seq_len, config_.nh, config_.dh});
@@ -174,8 +201,11 @@ tensor_t Qwen2Model::apply_layer(size_t layer_idx, const tensor_t& hidden_states
     pos_ids->load(pos_ids_vec.data());
     
     // Apply RoPE in-place
-    ops::rope(q, q, pos_ids, config_.theta);
-    ops::rope(k, k, pos_ids, config_.theta);
+    {
+        LLAISYS_NVTX_RANGE("rope");
+        ops::rope(q, q, pos_ids, config_.theta);
+        ops::rope(k, k, pos_ids, config_.theta);
+    }
     
     // 4. Update KV cache and get full K, V
     tensor_t full_k, full_v;
@@ -185,8 +215,11 @@ tensor_t Qwen2Model::apply_layer(size_t layer_idx, const tensor_t& hidden_states
     CHECK_ARGUMENT(kv_seq_len <= config_.maxseq, "apply_layer: kv_seq_len exceeds maxseq");
     tensor_t k_dst = kv_caches_[layer_idx].k_cache->slice(0, start_pos, kv_seq_len);
     tensor_t v_dst = kv_caches_[layer_idx].v_cache->slice(0, start_pos, kv_seq_len);
-    copy_contiguous_tensor_(k_dst, k);
-    copy_contiguous_tensor_(v_dst, v);
+    {
+        LLAISYS_NVTX_RANGE("kv_cache_copy");
+        copy_contiguous_tensor_(k_dst, k);
+        copy_contiguous_tensor_(v_dst, v);
+    }
 
     // Use full cached K/V for attention.
     full_k = kv_caches_[layer_idx].k_cache->slice(0, 0, kv_seq_len);
@@ -198,43 +231,66 @@ tensor_t Qwen2Model::apply_layer(size_t layer_idx, const tensor_t& hidden_states
     // Q: [seq_len, nh, dh], K,V: [kv_seq_len, nkvh, dh]
     tensor_t attn_out = Tensor::create({seq_len, config_.nh, config_.dh}, config_.dtype, device_type_, device_id);
     float scale = 1.0f / std::sqrt(static_cast<float>(config_.dh));
-    ops::self_attention(attn_out, q, full_k, full_v, scale);
+    {
+        LLAISYS_NVTX_RANGE("self_attention");
+        ops::self_attention(attn_out, q, full_k, full_v, scale);
+    }
     
     // 6. Output projection
     tensor_t attn_out_flat = attn_out->view({seq_len, config_.nh * config_.dh});
     tensor_t o_proj = Tensor::create({seq_len, config_.hs}, config_.dtype, device_type_, device_id);
-    ops::linear(o_proj, attn_out_flat, weights_.attn_o_w[layer_idx], nullptr);
+    {
+        LLAISYS_NVTX_RANGE("attention_output_projection");
+        ops::linear(o_proj, attn_out_flat, weights_.attn_o_w[layer_idx], nullptr);
+    }
     
     // 7. Residual connection
     tensor_t hidden_states_1 = Tensor::create({seq_len, config_.hs}, config_.dtype, device_type_, device_id);
-    ops::add(hidden_states_1, hidden_states, o_proj);
+    {
+        LLAISYS_NVTX_RANGE("attention_residual");
+        ops::add(hidden_states_1, hidden_states, o_proj);
+    }
     
     // 8. MLP norm
     tensor_t mlp_norm_out = Tensor::create({seq_len, config_.hs}, config_.dtype, device_type_, device_id);
-    ops::rms_norm(mlp_norm_out, hidden_states_1, weights_.mlp_norm_w[layer_idx], config_.epsilon);
+    {
+        LLAISYS_NVTX_RANGE("mlp_rms_norm");
+        ops::rms_norm(mlp_norm_out, hidden_states_1, weights_.mlp_norm_w[layer_idx], config_.epsilon);
+    }
     
     // 9. MLP layers
     tensor_t gate_out = Tensor::create({seq_len, config_.di}, config_.dtype, device_type_, device_id);
     tensor_t up_out = Tensor::create({seq_len, config_.di}, config_.dtype, device_type_, device_id);
     
-    ops::linear(gate_out, mlp_norm_out, weights_.mlp_gate_w[layer_idx], nullptr);
-    ops::linear(up_out, mlp_norm_out, weights_.mlp_up_w[layer_idx], nullptr);
+    {
+        LLAISYS_NVTX_RANGE("mlp_up_gate_projection");
+        ops::linear(gate_out, mlp_norm_out, weights_.mlp_gate_w[layer_idx], nullptr);
+        ops::linear(up_out, mlp_norm_out, weights_.mlp_up_w[layer_idx], nullptr);
+    }
     
     // 10. SwiGLU activation
     tensor_t swiglu_out = Tensor::create({seq_len, config_.di}, config_.dtype, device_type_, device_id);
-    ops::swiglu(swiglu_out, gate_out, up_out);
+    {
+        LLAISYS_NVTX_RANGE("swiglu");
+        ops::swiglu(swiglu_out, gate_out, up_out);
+    }
     
     // 11. Down projection
     tensor_t mlp_out = Tensor::create({seq_len, config_.hs}, config_.dtype, device_type_, device_id);
-    ops::linear(mlp_out, swiglu_out, weights_.mlp_down_w[layer_idx], nullptr);
+    {
+        LLAISYS_NVTX_RANGE("mlp_down_projection");
+        ops::linear(mlp_out, swiglu_out, weights_.mlp_down_w[layer_idx], nullptr);
+    }
     
     // 12. Residual connection
     tensor_t output = Tensor::create({seq_len, config_.hs}, config_.dtype, device_type_, device_id);
-    ops::add(output, hidden_states_1, mlp_out);
+    {
+        LLAISYS_NVTX_RANGE("mlp_residual");
+        ops::add(output, hidden_states_1, mlp_out);
+    }
     
     return output;
 }
 
 } // namespace models
 } // namespace llaisys
-

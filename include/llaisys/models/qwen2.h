@@ -43,6 +43,7 @@ __C {
     __export void llaisysQwen2ModelSetOutNormW(struct LlaisysQwen2Model * model, llaisysTensor_t tensor);
     __export void llaisysQwen2ModelSetLayerWeight(struct LlaisysQwen2Model * model, const char* name, size_t layer_idx, llaisysTensor_t tensor);
 
+    __export void llaisysQwen2ModelResetCache(struct LlaisysQwen2Model * model);
     __export int64_t llaisysQwen2ModelInfer(struct LlaisysQwen2Model * model, int64_t * token_ids, size_t ntoken);
 }
 #endif // LLAISYS_MODELS_QWEN2_H

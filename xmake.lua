@@ -13,8 +13,18 @@ option("nv-gpu")
     set_description("Whether to compile implementations for Nvidia GPU")
 option_end()
 
+option("profiling")
+    set_default(false)
+    set_showmenu(true)
+    set_description("Enable NVTX ranges and CUDA source line information")
+option_end()
+
 if has_config("nv-gpu") then
     add_defines("ENABLE_NVIDIA_API")
+    add_includedirs("/usr/local/cuda/targets/x86_64-linux/include")
+    if has_config("profiling") then
+        add_defines("LLAISYS_ENABLE_NVTX")
+    end
     includes("xmake/nvidia.lua")
 end
 
@@ -129,6 +139,9 @@ target("llaisys")
         add_rules("cuda")
         add_cugencodes("sm_86")
         add_cuflags("-Xcompiler=-fPIC", {force = true})
+        if has_config("profiling") then
+            add_cuflags("-lineinfo", {force = true})
+        end
         add_files("src/llaisys/cuda_devlink_stub.cu")
         add_links("cudart", "cublas")
         add_linkdirs("/usr/local/cuda/lib64")

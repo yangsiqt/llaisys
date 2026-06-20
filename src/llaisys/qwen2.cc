@@ -173,4 +173,9 @@ int64_t llaisysQwen2ModelInfer(struct LlaisysQwen2Model *model, int64_t *token_i
     return model->model->infer(tokens);
 }
 
+void llaisysQwen2ModelResetCache(struct LlaisysQwen2Model *model) {
+    if (!model || !model->model) return;
+    model->model->reset_cache();
+}
+
 } // extern "C"

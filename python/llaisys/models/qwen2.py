@@ -225,6 +225,21 @@ class Qwen2:
 
         print(f"Weights loaded successfully! Total: {weight_count} tensors")
 
+    def reset_cache(self):
+        """Reset the incremental KV cache for a new sequence."""
+        LIB_LLAISYS.llaisysQwen2ModelResetCache(self._model)
+
+    def infer_step(self, tokens: Sequence[int]) -> int:
+        """Process newly appended tokens and return the next greedy token."""
+        if not tokens:
+            raise ValueError("tokens must not be empty")
+        token_array = (c_int64 * len(tokens))(*tokens)
+        return int(
+            LIB_LLAISYS.llaisysQwen2ModelInfer(
+                self._model, token_array, len(tokens)
+            )
+        )
+
     def generate(
         self,
         inputs: Sequence[int],
@@ -249,15 +264,7 @@ class Qwen2:
         for i in range(max_new_tokens):
             sys.stdout.flush()
 
-            # Convert to ctypes array
-            token_array = (c_int64 * len(output_tokens))(*output_tokens)
-
-            sys.stdout.flush()
-
-            # Call inference
-            next_token = LIB_LLAISYS.llaisysQwen2ModelInfer(
-                self._model, token_array, len(output_tokens)
-            )
+            next_token = self.infer_step(output_tokens)
 
             sys.stdout.flush()
 

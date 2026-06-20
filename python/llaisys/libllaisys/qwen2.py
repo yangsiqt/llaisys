@@ -81,6 +81,9 @@ def load_qwen2(lib):
 
     lib.llaisysQwen2ModelSetLayerWeight.argtypes = [llaisysQwen2Model_t, c_char_p, c_size_t, llaisysTensor_t]
     lib.llaisysQwen2ModelSetLayerWeight.restype = None
+
+    lib.llaisysQwen2ModelResetCache.argtypes = [llaisysQwen2Model_t]
+    lib.llaisysQwen2ModelResetCache.restype = None
     
     # llaisysQwen2ModelInfer
     lib.llaisysQwen2ModelInfer.argtypes = [
@@ -89,4 +92,3 @@ def load_qwen2(lib):
         c_size_t,
     ]
     lib.llaisysQwen2ModelInfer.restype = c_int64
-

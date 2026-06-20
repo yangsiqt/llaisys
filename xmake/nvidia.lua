@@ -4,6 +4,9 @@ target("llaisys-device-nvidia")
     set_languages("cxx17")
     add_cugencodes("sm_86")
     add_cuflags("-Xcompiler=-fPIC", {force = true})
+    if has_config("profiling") then
+        add_cuflags("-lineinfo", {force = true})
+    end
 
     add_files("../src/device/nvidia/*.cu")
 
@@ -18,6 +21,9 @@ target("llaisys-ops-nvidia")
     add_cugencodes("sm_86")
     add_cuflags("-Xcompiler=-fPIC", {force = true})
     add_cuflags("--expt-relaxed-constexpr", {force = true})
+    if has_config("profiling") then
+        add_cuflags("-lineinfo", {force = true})
+    end
 
     add_includedirs("../third_party/cutlass/include")
     add_links("cublas")
