@@ -8,6 +8,9 @@
 #ifdef ENABLE_NVIDIA_API
 #include "nvidia/rearrange_nvidia.hpp"
 #endif
+#ifdef ENABLE_ASCEND_API
+#include "ascend/rearrange_ascend.hpp"
+#endif
 
 #include <cstring>
 
@@ -48,6 +51,10 @@ void rearrange(tensor_t out, tensor_t in) {
 #ifdef ENABLE_NVIDIA_API
     case LLAISYS_DEVICE_NVIDIA:
         return nvidia::rearrange(out->data(), in->data(), in->shape(), out->strides(), in->strides(), out->dtype());
+#endif
+#ifdef ENABLE_ASCEND_API
+    case LLAISYS_DEVICE_ASCEND:
+        return ascend::rearrange(out->data(), in->data(), in->shape(), out->strides(), in->strides(), out->dtype());
 #endif
     default:
         EXCEPTION_UNSUPPORTED_DEVICE;

@@ -6,6 +6,9 @@
 #ifdef ENABLE_NVIDIA_API
 #include "nvidia/add_nvidia.hpp"
 #endif
+#ifdef ENABLE_ASCEND_API
+#include "ascend/add_ascend.hpp"
+#endif
 
 namespace llaisys {
 namespace ops {
@@ -32,6 +35,11 @@ void add(const tensor_t& out, const tensor_t& a, const tensor_t& b) {
 #ifdef ENABLE_NVIDIA_API
     case LLAISYS_DEVICE_NVIDIA:
         nvidia::add(out->data(), a->data(), b->data(), out->dtype(), out->numel());
+        return;
+#endif
+#ifdef ENABLE_ASCEND_API
+    case LLAISYS_DEVICE_ASCEND:
+        ascend::add(out->data(), a->data(), b->data(), out->dtype(), out->numel());
         return;
 #endif
     default:

@@ -8,6 +8,9 @@
 #ifdef ENABLE_NVIDIA_API
 #include "nvidia/self_attention_nvidia.hpp"
 #endif
+#ifdef ENABLE_ASCEND_API
+#include "ascend/self_attention_ascend.hpp"
+#endif
 
 namespace llaisys::ops {
 void self_attention(tensor_t attn_val, tensor_t q, tensor_t k, tensor_t v, float scale) {
@@ -50,6 +53,10 @@ void self_attention(tensor_t attn_val, tensor_t q, tensor_t k, tensor_t v, float
 #ifdef ENABLE_NVIDIA_API
     case LLAISYS_DEVICE_NVIDIA:
         return nvidia::self_attention(attn_val->data(), q->data(), k->data(), v->data(), scale, attn_val->dtype(), qlen, kvlen, n_heads, n_kv_heads, head_dim);
+#endif
+#ifdef ENABLE_ASCEND_API
+    case LLAISYS_DEVICE_ASCEND:
+        return ascend::self_attention(attn_val->data(), q->data(), k->data(), v->data(), scale, attn_val->dtype(), qlen, kvlen, n_heads, n_kv_heads, head_dim);
 #endif
     default:
         EXCEPTION_UNSUPPORTED_DEVICE;

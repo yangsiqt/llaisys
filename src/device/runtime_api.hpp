@@ -17,4 +17,10 @@ namespace nvidia {
 const LlaisysRuntimeAPI *getRuntimeAPI();
 }
 #endif
+
+#ifdef ENABLE_ASCEND_API
+namespace ascend {
+const LlaisysRuntimeAPI *getRuntimeAPI();
+}
+#endif
 } // namespace llaisys::device

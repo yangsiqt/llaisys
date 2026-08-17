@@ -2,6 +2,15 @@ import llaisys
 import torch
 
 
+def synchronize_torch_device(device_name):
+    """Make data produced by a framework stream visible to raw runtime copies."""
+    if device_name == "nvidia":
+        torch.cuda.synchronize()
+    elif device_name == "ascend":
+        import torch_npu  # noqa: F401
+        torch.npu.synchronize()
+
+
 def random_tensor(
     shape, dtype_name, device_name, device_id=0, scale=None, bias=None
 ) -> tuple[torch.Tensor, llaisys.Tensor]:
@@ -15,6 +24,9 @@ def random_tensor(
     if bias is not None:
         torch_tensor += bias
 
+    # On Ascend the first LLAISYS tensor initializes its own ACL context.
+    # Finish producer work before that context switch, not merely before copy.
+    synchronize_torch_device(device_name)
     llaisys_tensor = llaisys.Tensor(
         shape,
         dtype=llaisys_dtype(dtype_name),
@@ -43,6 +55,7 @@ def random_int_tensor(shape, device_name, dtype_name="i64", device_id=0, low=0, 
         device=torch_device(device_name, device_id),
     )
 
+    synchronize_torch_device(device_name)
     llaisys_tensor = llaisys.Tensor(
         shape,
         dtype=llaisys_dtype(dtype_name),
@@ -71,6 +84,7 @@ def zero_tensor(
         device=torch_device(device_name, device_id),
     )
 
+    synchronize_torch_device(device_name)
     llaisys_tensor = llaisys.Tensor(
         shape,
         dtype=llaisys_dtype(dtype_name),
@@ -94,6 +108,7 @@ def arrange_tensor(
     start, end, device_name, device_id=0
 ) -> tuple[torch.Tensor, llaisys.Tensor]:
     torch_tensor = torch.arange(start, end, device=torch_device(device_name, device_id))
+    synchronize_torch_device(device_name)
     llaisys_tensor = llaisys.Tensor(
         (end - start,),
         dtype=llaisys_dtype("i64"),
@@ -140,6 +155,9 @@ def check_equal(
         ),
     )
     result = torch.as_strided(tmp, shape, strides)
+    # The zero-fill is queued on torch's stream; finish it before a raw ACL
+    # D2D copy writes into the same storage from another stream.
+    synchronize_torch_device(device_name(llaisys_result.device_type()))
     api = llaisys.RuntimeAPI(llaisys_result.device_type())
     api.memcpy_sync(
         result.data_ptr(),
@@ -188,6 +206,9 @@ def torch_device(device_name: str, device_id=0):
         return torch.device("cpu")
     elif device_name == "nvidia":
         return torch.device(f"cuda:{device_id}")
+    elif device_name == "ascend":
+        import torch_npu  # noqa: F401
+        return torch.device(f"npu:{device_id}")
     else:
         raise ValueError(f"Unsupported device name: {device_name}")
 
@@ -197,6 +218,8 @@ def llaisys_device(device_name: str):
         return llaisys.DeviceType.CPU
     elif device_name == "nvidia":
         return llaisys.DeviceType.NVIDIA
+    elif device_name == "ascend":
+        return llaisys.DeviceType.ASCEND
     else:
         raise ValueError(f"Unsupported device name: {device_name}")
 
@@ -206,6 +229,8 @@ def device_name(llaisys_device: llaisys.DeviceType):
         return "cpu"
     elif llaisys_device == llaisys.DeviceType.NVIDIA:
         return "nvidia"
+    elif llaisys_device == llaisys.DeviceType.ASCEND:
+        return "ascend"
     else:
         raise ValueError(f"Unsupported llaisys device: {llaisys_device}")
 

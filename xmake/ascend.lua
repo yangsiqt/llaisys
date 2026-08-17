@@ -1,0 +1,23 @@
+local ascend_home = "/usr/local/Ascend/ascend-toolkit/latest"
+
+target("llaisys-device-ascend")
+    set_kind("static")
+    set_languages("cxx17")
+    set_warnings("all", "error")
+    add_cxflags("-fPIC", "-Wno-unknown-pragmas")
+    add_includedirs(ascend_home .. "/include")
+    add_files("../src/device/ascend/*.cpp")
+    on_install(function (target) end)
+target_end()
+
+target("llaisys-ops-ascend")
+    set_kind("static")
+    add_deps("llaisys-tensor")
+    add_deps("llaisys-device-ascend")
+    set_languages("cxx17")
+    set_warnings("all", "error")
+    add_cxflags("-fPIC", "-Wno-unknown-pragmas")
+    add_includedirs(ascend_home .. "/include")
+    add_files("../src/ops/*/ascend/*.cpp")
+    on_install(function (target) end)
+target_end()

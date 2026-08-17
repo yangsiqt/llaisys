@@ -8,6 +8,9 @@
 #ifdef ENABLE_NVIDIA_API
 #include "nvidia/swiglu_nvidia.hpp"
 #endif
+#ifdef ENABLE_ASCEND_API
+#include "ascend/swiglu_ascend.hpp"
+#endif
 
 namespace llaisys::ops {
 void swiglu(tensor_t out, tensor_t gate, tensor_t up) {
@@ -32,6 +35,10 @@ void swiglu(tensor_t out, tensor_t gate, tensor_t up) {
 #ifdef ENABLE_NVIDIA_API
     case LLAISYS_DEVICE_NVIDIA:
         return nvidia::swiglu(out->data(), gate->data(), up->data(), out->dtype(), out->numel());
+#endif
+#ifdef ENABLE_ASCEND_API
+    case LLAISYS_DEVICE_ASCEND:
+        return ascend::swiglu(out->data(), gate->data(), up->data(), out->dtype(), out->numel());
 #endif
     default:
         EXCEPTION_UNSUPPORTED_DEVICE;

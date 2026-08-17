@@ -28,6 +28,19 @@ if has_config("nv-gpu") then
     includes("xmake/nvidia.lua")
 end
 
+-- ASCEND --
+option("ascend-npu")
+    set_default(false)
+    set_showmenu(true)
+    set_description("Whether to compile implementations for Ascend NPU")
+option_end()
+
+if has_config("ascend-npu") then
+    add_defines("ENABLE_ASCEND_API")
+    add_includedirs("/usr/local/Ascend/ascend-toolkit/latest/include")
+    includes("xmake/ascend.lua")
+end
+
 target("llaisys-utils")
     set_kind("static")
 
@@ -49,6 +62,9 @@ target("llaisys-device")
     add_deps("llaisys-device-cpu")
     if has_config("nv-gpu") then
         add_deps("llaisys-device-nvidia")
+    end
+    if has_config("ascend-npu") then
+        add_deps("llaisys-device-ascend")
     end
 
     set_languages("cxx17")
@@ -99,6 +115,9 @@ target("llaisys-ops")
     if has_config("nv-gpu") then
         add_deps("llaisys-ops-nvidia")
     end
+    if has_config("ascend-npu") then
+        add_deps("llaisys-ops-ascend")
+    end
 
     set_languages("cxx17")
     set_warnings("all", "error")
@@ -145,6 +164,13 @@ target("llaisys")
         add_files("src/llaisys/cuda_devlink_stub.cu")
         add_links("cudart", "cublas")
         add_linkdirs("/usr/local/cuda/lib64")
+    end
+    if has_config("ascend-npu") then
+        add_links("ascendcl", "opapi", "nnopbase", "atb")
+        add_linkdirs("/usr/local/Ascend/ascend-toolkit/latest/lib64")
+        add_linkdirs("/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/lib")
+        add_rpathdirs("/usr/local/Ascend/ascend-toolkit/latest/lib64")
+        add_rpathdirs("/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/lib")
     end
 
     set_languages("cxx17")

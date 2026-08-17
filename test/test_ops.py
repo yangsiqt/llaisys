@@ -109,9 +109,8 @@ def run_all_tests(device="cpu", profile=False):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--device", default="cpu", choices=["cpu", "nvidia"], type=str)
+    parser.add_argument("--device", default="cpu", choices=["cpu", "nvidia", "ascend"], type=str)
     parser.add_argument("--profile", action="store_true")
     args = parser.parse_args()
     
     run_all_tests(args.device, args.profile)
-
